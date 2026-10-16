@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local capture output
+captures/
+*.bmp
+
+# SOLIDWORKS temporary / backup files
+~$*
+*.sldprt~
+*.sldasm~
+*.slddrw~
