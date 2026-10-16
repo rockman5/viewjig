@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "viewjig"
+version = "0.0.1"
+description = "Repeatable, perfectly matched SOLIDWORKS captures for design reviews and engineering presentations."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Andre Stone" }
+]
+dependencies = [
+  "Pillow>=10",
+  "pywin32>=306; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "ruff>=0.7",
+]
+
+[project.scripts]
+viewjig = "viewjig.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/viewjig"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
