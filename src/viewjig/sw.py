@@ -7,8 +7,8 @@ read-only document lifecycle. Framing and measurement live elsewhere.
 Why explicit invocation: SOLIDWORKS objects expose no IDispatch type information,
 so pywin32's dynamic dispatch guesses whether a name is a property or a method
 and invokes unknown names on attribute access. A zero-argument method such as
-``GetPathName`` then runs, and returns its value, before it can be called
-(probes/capture_01_findings.md, O12). ``Com`` never invokes on attribute access;
+``GetPathName`` then runs, and returns its value, before it can be called.
+``Com`` never invokes on attribute access;
 callers state whether a member is a method (``call``) or a property (``get`` /
 ``put``), as the SOLIDWORKS API documents it.
 
@@ -77,7 +77,11 @@ class DocumentActivationFailed(SolidWorksError):
 
 
 class DocumentModified(SolidWorksError):
-    """The document reported unsaved changes when ViewJig closed it."""
+    """A document that was clean when ViewJig opened it became dirty while ViewJig held it."""
+
+
+class DocumentNotClean(SolidWorksError):
+    """A document ViewJig had just opened read-only already reported unsaved changes."""
 
 
 class Dispatch(Protocol):
@@ -161,7 +165,6 @@ class Document:
     model: Com
     path: Path
     title: str
-    dirty_at_open: int
     dirty_at_close: int | None = None
 
     def view(self) -> Com:
@@ -185,9 +188,13 @@ def open_document(app: Com, path: Path | str) -> Iterator[Document]:
     """Open ``path`` read-only for the duration of the block, then always close it.
 
     Refuses a document that is already open in SOLIDWORKS, so ViewJig never acts on
-    (or closes) a document someone else is working on. Raises ``DocumentModified`` on
-    a clean exit if SOLIDWORKS reports unsaved changes at close; the source file is
-    safe either way, because it was opened read-only and is never saved.
+    (or closes) a document someone else is working on.
+
+    Dirty state: the document must report no unsaved changes once opened and
+    activated, or ``DocumentNotClean`` is raised (after closing it). If it becomes
+    dirty while the block runs, ``DocumentModified`` is raised on an otherwise clean
+    exit, after closing. The source file is safe either way: it was opened read-only
+    and is never saved.
     """
     path = Path(path).resolve()
     doc_type = DOCUMENT_TYPES.get(path.suffix.lower())
@@ -213,7 +220,12 @@ def open_document(app: Com, path: Path | str) -> Iterator[Document]:
     title = str(model.call("GetTitle"))
     try:
         _activate(app, title, path)
-        document = Document(app, model, path, title, int(model.call("GetSaveFlag")))
+        initial = int(model.call("GetSaveFlag"))
+        if initial:
+            raise DocumentNotClean(
+                f"{path.name} reported unsaved changes ({initial}) immediately after opening"
+            )
+        document = Document(app, model, path, title)
         yield document
         document.dirty_at_close = document.save_flag()
     except BaseException as exc:
@@ -226,7 +238,7 @@ def open_document(app: Com, path: Path | str) -> Iterator[Document]:
     app.call("CloseDoc", title)
     if document.dirty_at_close:
         raise DocumentModified(
-            f"{path.name} reported unsaved changes ({document.dirty_at_close}) at close"
+            f"{path.name} became dirty ({document.dirty_at_close}) while ViewJig held it"
         )
 
 

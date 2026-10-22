@@ -1,7 +1,7 @@
 """Fixed-size raster capture through ``IModelDoc2.SaveBMP``.
 
-SaveBMP returns exactly the requested dimensions and is deterministic for a given
-camera (probes/capture_01_findings.md, O1; capture_02_findings.md, I1). This module
+For a given camera and requested size, SaveBMP output is deterministic and is
+expected to have exactly the requested dimensions; this module checks that. It
 only captures: it writes a temporary BMP, loads it into memory as an RGB image,
 checks its size, and deletes the file. Framing and measurement live elsewhere.
 """

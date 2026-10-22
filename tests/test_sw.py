@@ -14,6 +14,7 @@ from viewjig.sw import (
     DocumentActivationFailed,
     DocumentAlreadyOpen,
     DocumentModified,
+    DocumentNotClean,
     DocumentNotReadOnly,
     DocumentOpenFailed,
     StandardView,
@@ -135,7 +136,6 @@ def test_opens_read_only_silently_and_closes_on_success(solidworks: FakeSolidWor
     with open_document(Com(solidworks.app), solidworks.path) as document:
         assert document.title == "vj-f01"
         assert document.path == solidworks.path
-        assert document.dirty_at_open == 0
         assert isinstance(document.view(), Com)
     opens = [args for who, name, _, args in solidworks.log if name == "OpenDoc6"]
     assert len(opens) == 1
@@ -231,9 +231,11 @@ def test_close_failure_after_success_is_raised(solidworks: FakeSolidWorks) -> No
         pass
 
 
-def test_unsaved_changes_at_close_raise_after_closing(solidworks: FakeSolidWorks) -> None:
+def test_clean_document_that_becomes_dirty_raises_modified_after_closing(
+    solidworks: FakeSolidWorks,
+) -> None:
     with (
-        pytest.raises(DocumentModified),
+        pytest.raises(DocumentModified, match="became dirty"),
         open_document(Com(solidworks.app), solidworks.path) as document,
     ):
         solidworks.dirty = 1
@@ -241,13 +243,39 @@ def test_unsaved_changes_at_close_raise_after_closing(solidworks: FakeSolidWorks
     assert solidworks.closed == ["vj-f01"]
 
 
-def test_dirty_state_at_open_is_recorded(solidworks: FakeSolidWorks) -> None:
+def test_document_dirty_immediately_after_opening_is_refused_and_closed(
+    solidworks: FakeSolidWorks,
+) -> None:
     solidworks.dirty_at_open = 2
     with (
-        pytest.raises(DocumentModified),
-        open_document(Com(solidworks.app), solidworks.path) as document,
+        pytest.raises(DocumentNotClean, match=r"unsaved changes \(2\) immediately after opening"),
+        open_document(Com(solidworks.app), solidworks.path),
     ):
-        assert document.dirty_at_open == 2
+        pytest.fail("body must not run")
+    assert solidworks.closed == ["vj-f01"]
+
+
+def test_initial_dirty_state_is_checked_after_activation(solidworks: FakeSolidWorks) -> None:
+    solidworks.active_after_open = False
+    solidworks.dirty_at_open = 1
+    with (
+        pytest.raises(DocumentNotClean),
+        open_document(Com(solidworks.app), solidworks.path),
+    ):
+        pytest.fail("body must not run")
+    calls = solidworks.calls()
+    assert calls.index("ActivateDoc3") < calls.index("GetSaveFlag")
+    assert solidworks.closed == ["vj-f01"]
+
+
+def test_body_error_takes_precedence_over_becoming_dirty(solidworks: FakeSolidWorks) -> None:
+    with (
+        pytest.raises(RuntimeError, match="boom"),
+        open_document(Com(solidworks.app), solidworks.path),
+    ):
+        solidworks.dirty = 1
+        raise RuntimeError("boom")
+    assert solidworks.closed == ["vj-f01"]
 
 
 def test_document_view_operations_are_explicit_calls(solidworks: FakeSolidWorks) -> None:

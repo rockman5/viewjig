@@ -3,8 +3,8 @@
 A ``Camera`` is the view state that, together with an output size, fully
 determines a fixed-size capture: ``Orientation3`` (16 values), ``Translation3``
 (3 values), and ``Scale2``. It does not depend on the SOLIDWORKS window, window
-state, or session (probes/capture_02_findings.md), and it holds numbers only,
-never COM objects, so it can be stored and carried between documents.
+state, or session, and it holds numbers only, never COM objects, so it can be
+stored and carried between documents.
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ def apply_camera(document: Document, camera: Camera) -> Camera:
     """Apply ``camera`` to the document's view and return the exact readback.
 
     Order matters: assigning ``Scale2`` rescales the current ``Translation3``, so
-    ``Translation3`` is assigned last (probes/capture_01_findings.md, O9). Raises
+    ``Translation3`` is assigned last. Raises
     ``CameraReadbackMismatch`` if SOLIDWORKS does not report the same numbers back.
     """
     math_utility = document.app.call("GetMathUtility")
