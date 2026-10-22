@@ -411,3 +411,38 @@ def test_edge_overlap_rejects_invalid_max_shift(max_shift) -> None:
 def test_edge_overlap_rejects_invalid_line_luminance(limit) -> None:
     with pytest.raises(ValueError, match="line_luminance"):
         edge_overlap(canvas(10, 10), canvas(10, 10), line_luminance=limit)
+
+
+# --- Supplied background -----------------------------------------------------------------
+
+
+def test_supplied_background_is_the_classification_reference() -> None:
+    # A near-white border colour that would be inferred instead of the supplied white.
+    image = with_rect(canvas(60, 40, (250, 250, 250)), (20, 10, 40, 30))
+    image.putpixel((5, 5), (245, 245, 245))  # 10 from supplied white, 5 from the border colour
+    inferred = measure(image)
+    supplied = measure(image, background=WHITE)
+    assert inferred.background.color == (250, 250, 250) and inferred.bounds == Bounds(
+        20, 10, 40, 30
+    )
+    assert supplied.background.color == WHITE and supplied.background.source == "supplied"
+    assert supplied.bounds == Bounds(5, 5, 40, 30)  # (245, ...) is foreground against white
+
+
+def test_supplied_background_drift_is_rejected() -> None:
+    image = with_rect(canvas(60, 40, (40, 50, 60)), (20, 10, 40, 30))
+    with pytest.raises(BackgroundUncertain, match="supplied background"):
+        measure(image, background=WHITE)
+
+
+def test_supplied_background_records_border_support_and_provenance() -> None:
+    m = measure(with_rect(canvas(60, 40), (0, 10, 30, 30)), background=WHITE)
+    assert m.background.source == "supplied"
+    assert 0.6 < m.background.border_support < 1.0
+    assert m.to_dict()["background"]["source"] == "supplied"
+    assert measure(canvas(60, 40)).background.source == "inferred"
+
+
+def test_background_and_expected_background_are_exclusive() -> None:
+    with pytest.raises(ValueError, match="either"):
+        measure(canvas(20, 20), background=WHITE, expected_background=WHITE)

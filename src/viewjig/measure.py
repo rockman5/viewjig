@@ -31,7 +31,9 @@ most common border colour, accepted only if at least ``min_border_support`` of
 border pixels are within ``threshold`` of it. Otherwise ``BackgroundUncertain``
 is raised instead of producing a measurement. A foreground covering most of the
 border would make the inference unreliable; passing ``expected_background``
-turns that into an explicit check.
+turns that into an explicit check. Passing ``background`` instead makes a known
+colour the classification reference, checked against the border but never
+replaced, so a series of captures shares one background.
 """
 
 from __future__ import annotations
@@ -176,6 +178,7 @@ class Background:
     color: RGB
     border_support: float  # share of border pixels within threshold of ``color``
     border_pixels: int
+    source: str = "inferred"  # "inferred" from this image's border, or "supplied" by the caller
 
 
 @dataclass(frozen=True)
@@ -194,6 +197,7 @@ class Measurement(Extent):
                 "color": list(self.background.color),
                 "border_support": self.background.border_support,
                 "border_pixels": self.background.border_pixels,
+                "source": self.background.source,
             },
             "foreground_pixels": self.foreground_pixels,
         }
@@ -263,6 +267,36 @@ def infer_background(
     return Background(color, support, ring.width)
 
 
+def check_background(
+    image: Image.Image,
+    color: RGB,
+    threshold: int = DEFAULT_THRESHOLD,
+    *,
+    min_border_support: float = DEFAULT_MIN_BORDER_SUPPORT,
+) -> Background:
+    """Confirm a caller-supplied background against this image's border.
+
+    The supplied colour stays authoritative for classification; this only checks
+    that the image still shows it. If less than ``min_border_support`` of the border
+    is within ``threshold`` of it, the scene's background has drifted and
+    ``BackgroundUncertain`` is raised.
+    """
+    _check_threshold(threshold)
+    rgb = _rgb(image)
+    if rgb.width < 3 or rgb.height < 3:
+        raise MeasurementError(f"image too small to have a border: {rgb.width}x{rgb.height}")
+    color = (int(color[0]), int(color[1]), int(color[2]))
+    ring = _border(rgb)
+    near = _difference(ring, color).point(lambda v: 255 if v <= threshold else 0)
+    support = near.histogram()[255] / ring.width
+    if support < min_border_support:
+        raise BackgroundUncertain(
+            f"supplied background {color} covers only {support:.1%} of the border "
+            f"(within threshold {threshold}); need {min_border_support:.0%}"
+        )
+    return Background(color, support, ring.width, source="supplied")
+
+
 def foreground_mask(
     image: Image.Image, background: RGB, threshold: int = DEFAULT_THRESHOLD
 ) -> Image.Image:
@@ -277,21 +311,34 @@ def measure(
     *,
     min_border_support: float = DEFAULT_MIN_BORDER_SUPPORT,
     expected_background: RGB | None = None,
+    background: RGB | None = None,
 ) -> Measurement:
-    background = infer_background(
-        image,
-        threshold,
-        min_border_support=min_border_support,
-        expected_background=expected_background,
-    )
-    mask = foreground_mask(image, background.color, threshold)
+    """Measure the foreground of ``image``.
+
+    By default the background is inferred from the border (optionally checked
+    against ``expected_background``). Passing ``background`` makes that colour the
+    classification reference instead; it is only checked, never replaced, so a
+    series of captures keeps one background (see ``check_background``).
+    """
+    if background is not None:
+        if expected_background is not None:
+            raise ValueError("pass either background or expected_background, not both")
+        bg = check_background(image, background, threshold, min_border_support=min_border_support)
+    else:
+        bg = infer_background(
+            image,
+            threshold,
+            min_border_support=min_border_support,
+            expected_background=expected_background,
+        )
+    mask = foreground_mask(image, bg.color, threshold)
     box = mask.getbbox()
     return Measurement(
         image_width=image.width,
         image_height=image.height,
         bounds=None if box is None else Bounds(*box),
         threshold=threshold,
-        background=background,
+        background=bg,
         foreground_pixels=mask.histogram()[255],
     )
 
