@@ -41,7 +41,7 @@ ViewJig makes CAD models visually comparable. It does not decide what their diff
 
 ## Status
 
-Early development. The first engineering milestone is independent characterization of SOLIDWORKS view and raster-capture behavior using neutral public fixtures.
+Early development. The first engineering milestone, independent characterization of SOLIDWORKS view and raster-capture behavior using neutral public fixtures, is complete; see [probes/README.md](probes/README.md). Production capture and framing are next.
 
 ## Platform
 
