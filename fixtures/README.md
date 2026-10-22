@@ -13,16 +13,18 @@ The origin sits at a corner, not the centre, so "centred on the origin" and
 "centred on the model" give visibly different results.
 
 Units: MMGS. Coordinates are model coordinates (+Y up, Front view looks from +Z).
+The part lies behind the Front Plane (Z ≤ 0), with the origin at its
+front-left-bottom corner. This is the geometry of the committed part file.
 
 | # | Feature | Definition |
 |---|---------|------------|
-| 1 | Base | Box X 0→120, Z 0→70, Y 0→10 (sketch on Top Plane, one corner at the origin, extrude up 10). |
-| 2 | Upright | Box X 0→25, Z 0→70, Y 10→50 (sketch on the base top face, extrude up 40). |
-| 3 | Hole | Ø20 through all, vertical (along Y), centre at X 85, Z 25. |
-| 4 | Chamfer | 20 × 20 mm on the vertical base edge at X 120, Z 70 (front-right corner in plan). |
+| 1 | Base | Box X 0→120, Z −70→0, Y 0→10 (sketch on Top Plane, one corner at the origin, extrude up 10). |
+| 2 | Upright | Box X 0→25, Z −70→0, Y 10→50 (sketch on the base top face, extrude up 40). |
+| 3 | Hole | Ø20 through all, vertical (along Y), centre at X 85, Z −25. |
+| 4 | Chamfer | 20 × 20 mm on the vertical base edge at X 120, Z −70 (back-right corner in plan). |
 
-Expected bounding box: X [0, 120], Y [0, 50], Z [0, 70] mm. The capture probe
-records `GetPartBox`, which should report this in metres.
+Bounding box: X [0, 120], Y [0, 50], Z [−70, 0] mm. The capture probe records
+`GetPartBox` in metres; the first live run reported exactly this.
 
 Authoring rules: single solid body, default configuration only, default
 appearance (no colours, textures, decals, or scenes), no external references,
