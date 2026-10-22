@@ -58,4 +58,4 @@ Authoring: open `vj-f01.SLDPRT`, immediately use **File → Save As** to
 extrusion depth from 40 to 60 mm, rebuild, and save. VJ-F01 must remain
 byte-identical in Git afterwards.
 
-Saved with: _(fill in)_
+Saved with: SOLIDWORKS Design Premium 2026 SP4.0
