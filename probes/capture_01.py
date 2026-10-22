@@ -98,6 +98,9 @@ def attempt(fn: Callable[[], Any]) -> dict[str, Any]:
 
 
 def plain(value: Any) -> Any:
+    """Make a value JSON-ready, keeping nested structure; only opaque objects become repr."""
+    if isinstance(value, dict):
+        return {str(key): plain(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [plain(item) for item in value]
     if value is None or isinstance(value, (bool, int, float, str)):
