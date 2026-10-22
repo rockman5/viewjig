@@ -18,7 +18,16 @@ Questions it is designed to answer:
 
 Safety: the probe attaches to an already running SOLIDWORKS (it never launches
 one), opens the given model read-only unless it is already open, touches only
-that document, never saves, and closes the document only if it opened it.
+that document, and never saves. It refuses to run if the model is already open,
+so every run starts from a fresh read-only document, which it closes afterwards.
+
+COM binding: pywin32's dynamic dispatch decides from type information whether a
+name is a property or a method, and invokes unknown names on attribute access.
+SOLIDWORKS document objects do not describe every documented member that way
+(live run: GetPathName came back as a str before it could be called). The probe
+therefore never uses attribute access on SOLIDWORKS objects; it goes through
+Com, which invokes each member explicitly as the method or property the public
+API documents.
 
 Usage (Windows, SOLIDWORKS running):
 
@@ -48,7 +57,6 @@ from typing import Any
 import pythoncom
 import pywintypes
 import win32com.client
-import win32com.client.dynamic
 from PIL import Image, ImageChops
 
 # Public SOLIDWORKS API enum values.
@@ -97,12 +105,6 @@ def plain(value: Any) -> Any:
     return repr(value)
 
 
-def member(obj: Any, name: str) -> Any:
-    """Read a COM member that may be exposed as either a property or a method."""
-    value = getattr(obj, name)
-    return value() if callable(value) else value
-
-
 def same_file(a: str, b: str) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
@@ -110,52 +112,103 @@ def same_file(a: str, b: str) -> bool:
 # --- SOLIDWORKS session -----------------------------------------------------
 
 
-def attach() -> Any:
+CALL = pythoncom.DISPATCH_METHOD | pythoncom.DISPATCH_PROPERTYGET  # standard late-bound call
+GET = pythoncom.DISPATCH_PROPERTYGET
+PUT = pythoncom.DISPATCH_PROPERTYPUT
+PUTREF = pythoncom.DISPATCH_PROPERTYPUTREF
+IDISPATCH_TYPE = pythoncom.TypeIIDs[pythoncom.IID_IDispatch]
+
+
+class Com:
+    """Explicit IDispatch access: nothing is invoked by attribute lookup.
+
+    call() is for members the SOLIDWORKS API documents as methods, get()/put() for
+    documented properties. Returned dispatch objects are wrapped as Com too.
+    """
+
+    def __init__(self, dispatch: Any) -> None:
+        self.dispatch = dispatch
+
+    def _invoke(self, name: str, flags: int, result: bool, *args: Any) -> Any:
+        dispid = self.dispatch.GetIDsOfNames(name)
+        args = tuple(a.dispatch if isinstance(a, Com) else a for a in args)
+        return wrap(self.dispatch.Invoke(dispid, 0, flags, result, *args))
+
+    def call(self, name: str, *args: Any) -> Any:
+        return self._invoke(name, CALL, True, *args)
+
+    def get(self, name: str) -> Any:
+        return self._invoke(name, GET, True)
+
+    def put(self, name: str, value: Any, flags: int = PUT) -> None:
+        self._invoke(name, flags, False, value)
+
+    def interface(self) -> str:
+        """Name of the interface this object's own type information describes."""
+        return self.dispatch.GetTypeInfo().GetDocumentation(-1)[0]
+
+
+def wrap(value: Any) -> Any:
+    return Com(value) if isinstance(value, IDISPATCH_TYPE) else value
+
+
+def byref_long() -> win32com.client.VARIANT:
+    return win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+
+
+def attach() -> Com:
     clsid = pywintypes.IID("SldWorks.Application")
     try:
         unknown = pythoncom.GetActiveObject(clsid)
     except pythoncom.com_error as exc:
         raise SystemExit("SOLIDWORKS is not running. Start it, then rerun the probe.") from exc
-    return win32com.client.dynamic.Dispatch(unknown.QueryInterface(pythoncom.IID_IDispatch))
+    return Com(unknown.QueryInterface(pythoncom.IID_IDispatch))
 
 
-def open_model(sw: Any, path: Path) -> tuple[Any, bool]:
-    """Return (document, opened_by_probe). Opens read-only if not already open."""
-    existing = sw.GetOpenDocumentByName(str(path))
-    if existing is not None:
-        return existing, False
+def open_model(sw: Com, path: Path) -> Com:
+    """Open the model read-only. Refuses documents that are already open."""
+    if sw.call("GetOpenDocumentByName", str(path)) is not None:
+        raise SystemExit(f"{path.name} is already open in SOLIDWORKS. Close it and rerun.")
 
     doc_type = DOC_TYPES.get(path.suffix.lower())
     if doc_type is None:
         raise SystemExit(f"Unsupported document type: {path.suffix}")
-    errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-    warnings = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-    model = sw.OpenDoc6(str(path), doc_type, OPEN_SILENT | OPEN_READ_ONLY, "", errors, warnings)
+    errors, warnings = byref_long(), byref_long()
+    options = OPEN_SILENT | OPEN_READ_ONLY
+    model = sw.call("OpenDoc6", str(path), doc_type, options, "", errors, warnings)
     if model is None:
         raise SystemExit(f"OpenDoc6 failed (errors={errors.value}, warnings={warnings.value})")
-    return model, True
+    if not model.call("IsOpenedReadOnly"):
+        # OpenDoc6 handed back an existing editable document; never use or close it.
+        raise SystemExit(f"{path.name} is open for editing in SOLIDWORKS. Close it and rerun.")
+    return model
 
 
-def ensure_active(sw: Any, model: Any, path: Path) -> None:
-    active = sw.ActiveDoc
-    if active is not None and same_file(str(active.GetPathName()), str(path)):
+def ensure_active(sw: Com, title: str, path: Path) -> None:
+    def active_path() -> str | None:
+        active = sw.get("ActiveDoc")
+        return None if active is None else str(active.call("GetPathName"))
+
+    if (current := active_path()) is not None and same_file(current, str(path)):
         return
-    errors = win32com.client.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
-    sw.ActivateDoc3(model.GetTitle(), False, DONT_REBUILD, errors)
-    active = sw.ActiveDoc
-    if active is None or not same_file(str(active.GetPathName()), str(path)):
+    sw.call("ActivateDoc3", title, False, DONT_REBUILD, byref_long())
+    if (current := active_path()) is None or not same_file(current, str(path)):
         raise SystemExit("Could not make the probe document the active document.")
 
 
-def state(model: Any) -> dict[str, Any]:
+def view_of(model: Com) -> Com:
+    return model.get("ActiveView")
+
+
+def state(model: Com) -> dict[str, Any]:
     """Generic camera/view state plus the document's dirty flag."""
-    view = model.ActiveView
+    view = view_of(model)
     return {
-        "scale2": attempt(lambda: float(view.Scale2)),
-        "translation3": attempt(lambda: view.Translation3.ArrayData),
-        "orientation3": attempt(lambda: view.Orientation3.ArrayData),
-        "visible_box": attempt(lambda: view.GetVisibleBox()),
-        "dirty": attempt(lambda: int(model.GetSaveFlag())),
+        "scale2": attempt(lambda: float(view.get("Scale2"))),
+        "translation3": attempt(lambda: view.get("Translation3").get("ArrayData")),
+        "orientation3": attempt(lambda: view.get("Orientation3").get("ArrayData")),
+        "visible_box": attempt(lambda: view.call("GetVisibleBox")),
+        "dirty": attempt(lambda: int(model.call("GetSaveFlag"))),
     }
 
 
@@ -163,22 +216,34 @@ def camera_key(snapshot: dict[str, Any]) -> Any:
     return [snapshot[k].get("value") for k in ("scale2", "translation3", "orientation3")]
 
 
-def environment(sw: Any, model: Any) -> dict[str, Any]:
-    view = model.ActiveView
+def environment(sw: Com, model: Com) -> dict[str, Any]:
+    view = view_of(model)
     user32 = ctypes.windll.user32
     frame_members = ("FrameLeft", "FrameTop", "FrameWidth", "FrameHeight", "FrameState")
     return {
-        "solidworks_revision": attempt(lambda: member(sw, "RevisionNumber")),
+        "solidworks_revision": attempt(lambda: sw.call("RevisionNumber")),
         "python": sys.version,
         "platform": platform.platform(),
         "system_dpi": attempt(lambda: user32.GetDpiForSystem()),
         "primary_screen": attempt(lambda: [user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)]),
-        "app_frame": {m: attempt(lambda m=m: member(sw, m)) for m in frame_members},
-        "view_frame": {m: attempt(lambda m=m: member(view, m)) for m in frame_members},
-        "display_mode": attempt(lambda: member(view, "DisplayMode")),
-        "has_perspective": attempt(lambda: member(view, "HasPerspective")),
-        "part_box": attempt(lambda: model.GetPartBox(True)),
-        "read_only": attempt(lambda: member(model, "IsOpenedReadOnly")),
+        "app_frame": {m: attempt(lambda m=m: sw.get(m)) for m in frame_members},
+        "view_frame": {m: attempt(lambda m=m: view.get(m)) for m in frame_members},
+        "display_mode": attempt(lambda: view.get("DisplayMode")),
+        "has_perspective": attempt(lambda: view.call("HasPerspective")),
+        "part_box": attempt(lambda: model.call("GetPartBox", True)),
+        "read_only": attempt(lambda: model.call("IsOpenedReadOnly")),
+    }
+
+
+def binding(sw: Com, model: Com) -> dict[str, Any]:
+    """Interface each object's own type information claims; pywin32 binds by this."""
+    view = view_of(model)
+    return {
+        "application": attempt(sw.interface),
+        "document": attempt(model.interface),
+        "view": attempt(view.interface),
+        "math_vector": attempt(lambda: view.get("Translation3").interface()),
+        "math_transform": attempt(lambda: view.get("Orientation3").interface()),
     }
 
 
@@ -273,21 +338,21 @@ def analyze(bmp: Path, keep_bmp: bool) -> dict[str, Any]:
 
 
 class Probe:
-    def __init__(self, model: Any, out_dir: Path, keep_bmp: bool) -> None:
+    def __init__(self, model: Com, out_dir: Path, keep_bmp: bool) -> None:
         self.model = model
         self.out_dir = out_dir
         self.keep_bmp = keep_bmp
 
     def redraw(self) -> dict[str, Any]:
-        return attempt(lambda: self.model.GraphicsRedraw2())
+        return attempt(lambda: self.model.call("GraphicsRedraw2"))
 
     def establish(self, view_id: int = VIEW_ISOMETRIC) -> dict[str, Any]:
         """Standard view, then Zoom to Fit; record state after each step."""
         steps: dict[str, Any] = {
-            "show_named_view": attempt(lambda: self.model.ShowNamedView2("", view_id))
+            "show_named_view": attempt(lambda: self.model.call("ShowNamedView2", "", view_id))
         }
         steps["after_orient"] = state(self.model)
-        steps["zoom_to_fit"] = attempt(lambda: self.model.ViewZoomtofit2())
+        steps["zoom_to_fit"] = attempt(lambda: self.model.call("ViewZoomtofit2"))
         steps["after_fit"] = state(self.model)
         steps["redraw"] = self.redraw()
         steps["after_redraw"] = state(self.model)
@@ -299,7 +364,7 @@ class Probe:
         bmp.with_suffix(".png").unlink(missing_ok=True)
         before = state(self.model)
         started = time.perf_counter()
-        result = attempt(lambda: bool(self.model.SaveBMP(str(bmp), width, height)))
+        result = attempt(lambda: bool(self.model.call("SaveBMP", str(bmp), width, height)))
         seconds = round(time.perf_counter() - started, 3)
         after = state(self.model)
         return {
@@ -319,13 +384,23 @@ class Probe:
         return {"steps": results, "state": state(self.model)}
 
 
-def run(model: Any, out_dir: Path, keep_bmp: bool, report: dict[str, Any]) -> None:
+def put_object(view: Com, name: str, value: Com) -> dict[str, Any]:
+    """Assign an object-valued property, recording which COM put form SOLIDWORKS accepts."""
+    outcome = {"propertyput": attempt(lambda: view.put(name, value, PUT))}
+    if not outcome["propertyput"]["ok"]:
+        outcome["propertyputref"] = attempt(lambda: view.put(name, value, PUTREF))
+    return outcome
+
+
+def run(model: Com, out_dir: Path, keep_bmp: bool, report: dict[str, Any]) -> None:
     probe = Probe(model, out_dir, keep_bmp)
-    view = lambda: model.ActiveView
+
+    def view() -> Com:  # always re-read the active view
+        return view_of(model)
 
     # A. Fixed sizes from one established view, each captured twice back to back.
     baseline = probe.establish()
-    second_fit = attempt(lambda: model.ViewZoomtofit2())
+    second_fit = attempt(lambda: model.call("ViewZoomtofit2"))
     report["fixed_sizes"] = {
         "establish": baseline,
         "second_zoom_to_fit": second_fit,
@@ -337,22 +412,22 @@ def run(model: Any, out_dir: Path, keep_bmp: bool, report: dict[str, Any]) -> No
     rw, rh = REFERENCE_SIZE
     starts: dict[str, list[Callable[[], Any]]] = {
         "unchanged": [],
-        "front": [lambda: model.ShowNamedView2("", VIEW_FRONT)],
+        "front": [lambda: model.call("ShowNamedView2", "", VIEW_FRONT)],
         "top_zoom_3": [
-            lambda: model.ShowNamedView2("", VIEW_TOP),
-            lambda: view().ZoomByFactor(3.0),
+            lambda: model.call("ShowNamedView2", "", VIEW_TOP),
+            lambda: view().call("ZoomByFactor", 3.0),
         ],
         "trimetric_zoom_0.4": [
-            lambda: model.ShowNamedView2("", VIEW_TRIMETRIC),
-            lambda: view().ZoomByFactor(0.4),
+            lambda: model.call("ShowNamedView2", "", VIEW_TRIMETRIC),
+            lambda: view().call("ZoomByFactor", 0.4),
         ],
         "iso_panned": [
-            lambda: model.ShowNamedView2("", VIEW_ISOMETRIC),
-            lambda: view().TranslateBy(0.03, 0.02),
+            lambda: model.call("ShowNamedView2", "", VIEW_ISOMETRIC),
+            lambda: view().call("TranslateBy", 0.03, 0.02),
         ],
         "iso_rotated": [
-            lambda: model.ShowNamedView2("", VIEW_ISOMETRIC),
-            lambda: view().RotateAboutCenter(0.5, 0.8),
+            lambda: model.call("ShowNamedView2", "", VIEW_ISOMETRIC),
+            lambda: view().call("RotateAboutCenter", 0.5, 0.8),
         ],
     }
     report["start_views"] = []
@@ -364,38 +439,34 @@ def run(model: Any, out_dir: Path, keep_bmp: bool, report: dict[str, Any]) -> No
     # C. Save raw camera state, disturb the view, restore the state directly.
     probe.establish()
     saved = {
-        "orientation3": view().Orientation3,
-        "translation3": view().Translation3,
-        "scale2": view().Scale2,
+        "orientation3": view().get("Orientation3"),
+        "translation3": view().get("Translation3"),
+        "scale2": view().get("Scale2"),
     }
-    saved_values = [
-        saved["scale2"],
-        list(saved["translation3"].ArrayData),
-        list(saved["orientation3"].ArrayData),
-    ]
+
+    def saved_values() -> list[Any]:
+        return [
+            saved["scale2"],
+            list(saved["translation3"].get("ArrayData")),
+            list(saved["orientation3"].get("ArrayData")),
+        ]
+
+    before_disturb = saved_values()
     reference = probe.capture("C_reference", rw, rh)
     disturbed = probe.perturb(
-        starts["trimetric_zoom_0.4"] + [lambda: view().TranslateBy(0.02, -0.01)]
+        starts["trimetric_zoom_0.4"] + [lambda: view().call("TranslateBy", 0.02, -0.01)]
     )
     restore = {
-        "saved_objects_unchanged": attempt(
-            lambda: (
-                [
-                    saved["scale2"],
-                    list(saved["translation3"].ArrayData),
-                    list(saved["orientation3"].ArrayData),
-                ]
-                == saved_values
-            )
-        ),
-        "set_orientation3": attempt(lambda: setattr(view(), "Orientation3", saved["orientation3"])),
-        "set_translation3": attempt(lambda: setattr(view(), "Translation3", saved["translation3"])),
-        "set_scale2": attempt(lambda: setattr(view(), "Scale2", saved["scale2"])),
+        # False would mean the saved objects are live views of the camera, not snapshots.
+        "saved_objects_unchanged": attempt(lambda: saved_values() == before_disturb),
+        "set_orientation3": put_object(view(), "Orientation3", saved["orientation3"]),
+        "set_translation3": put_object(view(), "Translation3", saved["translation3"]),
+        "set_scale2": attempt(lambda: view().put("Scale2", saved["scale2"])),
         "redraw": probe.redraw(),
         "state": state(model),
     }
     report["camera_restore"] = {
-        "saved": saved_values,
+        "saved": before_disturb,
         "reference": reference,
         "disturbed": disturbed,
         "restore": restore,
@@ -489,30 +560,22 @@ def main() -> int:
         "thresholds": list(THRESHOLDS),
     }
     sw = attach()
-    model, opened = open_model(sw, model_path)
+    model = open_model(sw, model_path)
+    title = str(model.call("GetTitle"))
+    report["document"] = {"file_name": model_path.name, "title": title}
     try:
-        ensure_active(sw, model, model_path)
-        report["document"] = {
-            "file_name": model_path.name,
-            "opened_by_probe": opened,
-            "dirty_start": int(model.GetSaveFlag()),
-        }
-        if report["document"]["dirty_start"]:
-            print(
-                "WARNING: document already has unsaved changes; dirty tracking is not meaningful."
-            )
+        ensure_active(sw, title, model_path)
+        report["binding"] = binding(sw, model)
+        report["document"]["dirty_start"] = int(model.call("GetSaveFlag"))
         report["environment"] = environment(sw, model)
         run(model, out_dir, args.keep_bmp, report)
         report["environment_end"] = environment(sw, model)
-        report["document"]["dirty_end"] = int(model.GetSaveFlag())
+        report["document"]["dirty_end"] = int(model.call("GetSaveFlag"))
     except BaseException as exc:
         report["fatal"] = f"{type(exc).__name__}: {exc}"
         raise
     finally:
-        if opened:
-            report.setdefault("document", {})["closed"] = attempt(
-                lambda: sw.CloseDoc(model.GetTitle())
-            )
+        report["document"]["closed"] = attempt(lambda: sw.call("CloseDoc", title))
         report["finished"] = datetime.now(UTC).isoformat(timespec="seconds")
         (out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         summary = summarize(report)
