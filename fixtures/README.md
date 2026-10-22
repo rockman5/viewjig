@@ -32,3 +32,30 @@ no equations or custom properties. Record the SOLIDWORKS version it was saved in
 here, since part files do not open in older releases.
 
 Saved with: SOLIDWORKS Design Premium 2026 SP4.0
+
+## VJ-F01B — stepped bracket, tall upright (`vj-f01b.SLDPRT`)
+
+VJ-F01 with exactly one deliberate difference: the upright is 60 mm tall
+instead of 40 mm. Everything else — base, hole, chamfer, origin, orientation,
+units, and authoring rules — is identical, so the two parts occupy the same
+model coordinates except for the extra upright height.
+
+It exists to test matched capture across two separate documents: one camera
+applied to both should put the geometry they share on the same pixels, while
+native Zoom to Fit, seeing a taller part, picks a different camera.
+
+| # | Feature | Definition |
+|---|---------|------------|
+| 1 | Base | As VJ-F01: box X 0→120, Z −70→0, Y 0→10. |
+| 2 | Upright | Box X 0→25, Z −70→0, **Y 10→70** (extrude up **60**). |
+| 3 | Hole | As VJ-F01: Ø20 through all, vertical, centre at X 85, Z −25. |
+| 4 | Chamfer | As VJ-F01: 20 × 20 mm on the vertical base edge at X 120, Z −70. |
+
+Bounding box: X [0, 120], Y [0, **70**], Z [−70, 0] mm.
+
+Authoring: open `vj-f01.SLDPRT`, immediately use **File → Save As** to
+`vj-f01b.SLDPRT` (so VJ-F01 is never saved), change only the upright
+extrusion depth from 40 to 60 mm, rebuild, and save. VJ-F01 must remain
+byte-identical in Git afterwards.
+
+Saved with: _(fill in)_
