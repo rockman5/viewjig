@@ -399,3 +399,15 @@ def test_line_luminance_selects_which_pixels_count_as_lines() -> None:
 def test_edge_overlap_requires_same_size_images() -> None:
     with pytest.raises(SizeMismatch):
         edge_overlap(canvas(40, 30), canvas(40, 31))
+
+
+@pytest.mark.parametrize("max_shift", [0, -1, 1.5, True])
+def test_edge_overlap_rejects_invalid_max_shift(max_shift) -> None:
+    with pytest.raises(ValueError, match="max_shift"):
+        edge_overlap(canvas(10, 10), canvas(10, 10), max_shift=max_shift)
+
+
+@pytest.mark.parametrize("limit", [-1, 255, 64.0, False])
+def test_edge_overlap_rejects_invalid_line_luminance(limit) -> None:
+    with pytest.raises(ValueError, match="line_luminance"):
+        edge_overlap(canvas(10, 10), canvas(10, 10), line_luminance=limit)

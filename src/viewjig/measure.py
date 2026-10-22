@@ -366,6 +366,12 @@ class EdgeOverlap:
 
 def line_mask(image: Image.Image, line_luminance: int = DEFAULT_LINE_LUMINANCE) -> Image.Image:
     """255 where the pixel's luminance is at or below ``line_luminance`` (dark lines)."""
+    if (
+        isinstance(line_luminance, bool)
+        or not isinstance(line_luminance, int)
+        or not 0 <= line_luminance < 255
+    ):
+        raise ValueError(f"line_luminance must be an integer in [0, 255), got {line_luminance!r}")
     return image.convert("L").point(lambda v: 255 if v <= line_luminance else 0)
 
 
@@ -376,6 +382,8 @@ def edge_overlap(
     line_luminance: int = DEFAULT_LINE_LUMINANCE,
     max_shift: int = DEFAULT_MAX_SHIFT,
 ) -> EdgeOverlap:
+    if isinstance(max_shift, bool) or not isinstance(max_shift, int) or max_shift < 1:
+        raise ValueError(f"max_shift must be an integer >= 1, got {max_shift!r}")
     if a.size != b.size:
         raise SizeMismatch(f"edge overlap needs same-size images: {a.size} vs {b.size}")
     la, lb = line_mask(a, line_luminance), line_mask(b, line_luminance)
