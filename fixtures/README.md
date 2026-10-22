@@ -29,4 +29,4 @@ appearance (no colours, textures, decals, or scenes), no external references,
 no equations or custom properties. Record the SOLIDWORKS version it was saved in
 here, since part files do not open in older releases.
 
-Saved with: _(fill in, e.g. SOLIDWORKS 2026 SP4)_
+Saved with: SOLIDWORKS Design Premium 2026 SP4.0
