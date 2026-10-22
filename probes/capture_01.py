@@ -57,6 +57,8 @@ from typing import Any
 import pythoncom
 import pywintypes
 import win32com.client
+import win32con
+import win32gui
 from PIL import Image, ImageChops
 
 # Public SOLIDWORKS API enum values.
@@ -242,7 +244,55 @@ def environment(sw: Com, model: Com) -> dict[str, Any]:
         "has_perspective": attempt(lambda: view.call("HasPerspective")),
         "part_box": attempt(lambda: model.call("GetPartBox", True)),
         "read_only": attempt(lambda: model.call("IsOpenedReadOnly")),
+        "windows": windows(sw, view),
     }
+
+
+def window_chain(hwnd: int) -> list[dict[str, Any]]:
+    """Win32 state of a window and each ancestor up to the desktop, innermost first.
+
+    Records class names only, never titles: the SOLIDWORKS title bar can name
+    unrelated open documents.
+    """
+    chain = []
+    user32 = ctypes.windll.user32
+    desktop = win32gui.GetDesktopWindow()
+    while hwnd and hwnd != desktop:
+        chain.append(
+            {
+                "class": win32gui.GetClassName(hwnd),
+                "window_rect": list(win32gui.GetWindowRect(hwnd)),
+                "client_size": list(win32gui.GetClientRect(hwnd)[2:]),
+                "visible": bool(win32gui.IsWindowVisible(hwnd)),
+                "minimized": bool(user32.IsIconic(hwnd)),
+                "maximized": bool(user32.IsZoomed(hwnd)),
+            }
+        )
+        hwnd = win32gui.GetAncestor(hwnd, win32con.GA_PARENT)
+    return chain
+
+
+def windows(sw: Com, view: Com) -> dict[str, Any]:
+    """OS-level window state, which the SOLIDWORKS Frame* values do not make unambiguous."""
+    view_hwnd = attempt(lambda: int(view.call("GetViewHWndx64")))
+    app_hwnd = attempt(lambda: int(sw.call("Frame").call("GetHWndx64")))
+    result: dict[str, Any] = {"view_hwnd_ok": view_hwnd["ok"], "app_hwnd_ok": app_hwnd["ok"]}
+    if view_hwnd["ok"]:
+        hwnd = view_hwnd["value"]
+        result["view_chain"] = attempt(lambda: window_chain(hwnd))
+        result["foreground_is_solidworks"] = attempt(
+            lambda: (
+                win32gui.GetAncestor(win32gui.GetForegroundWindow(), win32con.GA_ROOT)
+                == win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
+            )
+        )
+    else:
+        result["view_hwnd_error"] = view_hwnd["error"]
+    if app_hwnd["ok"]:
+        result["app_window"] = attempt(lambda: window_chain(app_hwnd["value"])[:1])
+    else:
+        result["app_hwnd_error"] = app_hwnd["error"]
+    return result
 
 
 def binding(sw: Com, model: Com) -> dict[str, Any]:
@@ -550,8 +600,21 @@ def summarize(report: dict[str, Any]) -> str:
                     f"{step['state']['translation3'].get('value')} result={step['result']}"
                 )
 
-    doc = report.get("document", {})
     lines.append("")
+    for key in ("environment", "environment_end"):
+        win = report.get(key, {}).get("windows", {})
+        chain = win.get("view_chain", {}).get("value") or []
+        if chain:
+            lines.append(
+                f"{key}: view client={chain[0]['client_size']} "
+                f"minimized={any(w['minimized'] for w in chain)} "
+                f"top-level maximized={chain[-1]['maximized']} "
+                f"foreground={win.get('foreground_is_solidworks', {}).get('value')}"
+            )
+        else:
+            lines.append(f"{key}: window state unavailable {win}")
+
+    doc = report.get("document", {})
     lines.append(f"dirty: start={doc.get('dirty_start')} end={doc.get('dirty_end')}")
     if "fatal" in report:
         lines.append(f"FATAL: {report['fatal']}")
