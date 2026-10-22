@@ -83,6 +83,13 @@ SIZES = [
 ]
 REFERENCE_SIZE = (1600, 1200)
 
+# Orders in which the saved camera properties are assigned back to the view.
+RESTORE_ORDERS = [
+    ("Orientation3", "Translation3", "Scale2"),
+    ("Orientation3", "Scale2", "Translation3"),
+    ("Scale2", "Orientation3", "Translation3"),
+]
+
 # A pixel is foreground when its largest channel difference from the background
 # exceeds the threshold. Several thresholds are reported so the real one can be
 # chosen from evidence (anti-aliasing, edge lines, shading) rather than assumed.
@@ -439,42 +446,49 @@ def run(model: Com, out_dir: Path, keep_bmp: bool, report: dict[str, Any]) -> No
         entry["capture"] = probe.capture(f"B_{name}", rw, rh)
         report["start_views"].append(entry)
 
-    # C. Save raw camera state, disturb the view, restore the state directly.
+    # C. Save raw camera state, disturb the view, restore it by direct assignment. The
+    # first live run restored Translation3 multiplied by Scale2, so the assignment order
+    # is varied and the state is read back after every single assignment.
     probe.establish()
-    saved = {
-        "orientation3": view().get("Orientation3"),
-        "translation3": view().get("Translation3"),
-        "scale2": view().get("Scale2"),
-    }
+    saved = {name: view().get(name) for name in ("Orientation3", "Translation3", "Scale2")}
 
     def saved_values() -> list[Any]:
         return [
-            saved["scale2"],
-            list(saved["translation3"].get("ArrayData")),
-            list(saved["orientation3"].get("ArrayData")),
+            saved["Scale2"],
+            list(saved["Translation3"].get("ArrayData")),
+            list(saved["Orientation3"].get("ArrayData")),
         ]
 
     before_disturb = saved_values()
-    reference = probe.capture("C_reference", rw, rh)
-    disturbed = probe.perturb(
-        starts["trimetric_zoom_0.4"] + [lambda: view().call("TranslateBy", 0.02, -0.01)]
-    )
-    restore = {
-        # False would mean the saved objects are live views of the camera, not snapshots.
-        "saved_objects_unchanged": attempt(lambda: saved_values() == before_disturb),
-        "set_orientation3": put_object(view(), "Orientation3", saved["orientation3"]),
-        "set_translation3": put_object(view(), "Translation3", saved["translation3"]),
-        "set_scale2": attempt(lambda: view().put("Scale2", saved["scale2"])),
-        "redraw": probe.redraw(),
-        "state": state(model),
-    }
     report["camera_restore"] = {
         "saved": before_disturb,
-        "reference": reference,
-        "disturbed": disturbed,
-        "restore": restore,
-        "restored": probe.capture("C_restored", rw, rh),
+        "reference": probe.capture("C_reference", rw, rh),
+        "orders": [],
     }
+    for order in RESTORE_ORDERS:
+        disturbed = probe.perturb(
+            starts["trimetric_zoom_0.4"] + [lambda: view().call("TranslateBy", 0.02, -0.01)]
+        )
+        steps = []
+        for name in order:
+            value = saved[name]
+            if isinstance(value, Com):
+                result = put_object(view(), name, value)
+            else:
+                result = attempt(lambda name=name, value=value: view().put(name, value))
+            steps.append({"set": name, "result": result, "state": state(model)})
+        report["camera_restore"]["orders"].append(
+            {
+                "order": list(order),
+                "disturbed": disturbed,
+                # False would mean the saved objects are live views of the camera.
+                "saved_objects_unchanged": attempt(lambda: saved_values() == before_disturb),
+                "steps": steps,
+                "redraw": probe.redraw(),
+                "state": state(model),
+                "restored": probe.capture("C_restored_" + "-".join(order), rw, rh),
+            }
+        )
 
 
 # --- Summary -----------------------------------------------------------------
@@ -519,15 +533,22 @@ def summarize(report: dict[str, Any]) -> str:
         lines.append("")
         lines.append("C. camera restore")
         ref = fg(restore["reference"])[1].get("pixel_sha256")
-        got = fg(restore["restored"])[1].get("pixel_sha256")
-        lines.append(f"  reference={ref} restored={got} identical={ref == got and ref is not None}")
-        for key in (
-            "saved_objects_unchanged",
-            "set_orientation3",
-            "set_translation3",
-            "set_scale2",
-        ):
-            lines.append(f"  {key}: {restore['restore'][key]}")
+        scale, translation, orientation = restore["saved"]
+        lines.append(f"  reference hash={ref} saved scale2={scale!r} translation3={translation}")
+        for entry in restore.get("orders", []):
+            got = fg(entry["restored"])[1].get("pixel_sha256")
+            final = entry["state"]
+            lines.append(
+                f"  {'>'.join(entry['order']):<34} identical={ref == got and ref is not None} "
+                f"scale2={final['scale2'].get('value') == scale} "
+                f"orientation3={final['orientation3'].get('value') == orientation} "
+                f"translation3={final['translation3'].get('value')}"
+            )
+            for step in entry["steps"]:
+                lines.append(
+                    f"    after {step['set']:<13} translation3="
+                    f"{step['state']['translation3'].get('value')} result={step['result']}"
+                )
 
     doc = report.get("document", {})
     lines.append("")
