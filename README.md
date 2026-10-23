@@ -19,6 +19,19 @@ how it did it:
   Geometry the two parts have in common lands on the same pixels in both images,
   so you can flip between them or overlay them.
 
+## See it work
+
+Two revisions of the same SOLIDWORKS part. The upright depth changes from
+**40 mm to 60 mm**.
+
+ViewJig captures both with one shared camera, so unchanged geometry stays
+registered while the design change moves.
+
+![ViewJig registered before-and-after pair](docs/images/viewjig-pair-vj-f01-vj-f01b.gif)
+
+**No post-capture alignment.** These are the raw registered outputs from
+`viewjig pair`.
+
 Every capture also writes a JSON record of the camera, the measurements, and
 the verification, so a result can be checked and reproduced.
 
