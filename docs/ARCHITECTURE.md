@@ -61,6 +61,7 @@ src/viewjig/
   sw.py        SOLIDWORKS boundary: explicit COM calls, attach, read-only document lifecycle
   camera.py    plain-number camera (Orientation3, Translation3, Scale2): read, apply, JSON
   raster.py    fixed-size capture through SaveBMP
+  environment.py  plain white capture background, restored and read back afterwards
   measure.py   raster-only foreground measurement, combined extents, edge-overlap diagnostic
   framing.py   pure math: pan calibration, one predicted correction, verification
   steps.py     orchestration steps shared by shot and pair
@@ -69,10 +70,10 @@ src/viewjig/
   cli.py       `viewjig shot` and `viewjig pair`
 ```
 
-Only `sw.py`, `camera.py`, and `raster.py` talk to SOLIDWORKS. `measure.py` and
-`framing.py` work on images and numbers alone. `shot.py` and `pair.py` drive
-SOLIDWORKS through a small renderer interface, so the whole sequence is tested
-offline with a fake renderer.
+Only `sw.py`, `camera.py`, `raster.py`, and `environment.py` talk to
+SOLIDWORKS. `measure.py` and `framing.py` work on images and numbers alone.
+`shot.py` and `pair.py` drive SOLIDWORKS through a small renderer interface, so
+the whole sequence is tested offline with a fake renderer.
 
 ## Commands
 
