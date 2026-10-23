@@ -19,6 +19,7 @@ from viewjig.shot import (
     run_shot,
     write_record,
 )
+from viewjig.steps import BOOTSTRAP_MAX_ATTEMPTS, calibration_room_ok
 from viewjig.sw import StandardView
 
 
@@ -155,22 +156,113 @@ def test_failure_after_the_second_correction_stops_at_two_solves() -> None:
     assert "final" not in r
 
 
-def test_bootstrap_touching_an_edge_fails() -> None:
-    with pytest.raises(ShotError, match="bootstrap foreground touches the image edge") as info:
-        run_shot(FakeRenderer(fit_fill=1.6), request())
-    assert info.value.record["attempts"] == []
+# --- Bootstrap recovery ------------------------------------------------------------------------
 
 
-def test_empty_bootstrap_fails() -> None:
-    with pytest.raises(ShotError, match="no foreground"):
+def bootstrap_attempts(record) -> list[tuple[float, str | None]]:
+    return [(a["factor"], a["problem"]) for a in record["bootstrap_attempts"]]
+
+
+def test_first_bootstrap_success_keeps_the_original_capture_count() -> None:
+    record = run_shot(FakeRenderer(), request()).record
+    assert bootstrap_attempts(record) == [(BOOTSTRAP_SCALE, None)]
+    pilots = sum(len(p) for p in record["calibration"]["pilot"].values())
+    # bootstrap + pilot captures + (-step, +step) per axis + one per correction attempt
+    assert record["captures"] == 1 + pilots + 4 + len(record["attempts"])
+
+
+def test_clipped_first_bootstrap_recovers_by_zooming_out() -> None:
+    renderer = FakeRenderer(fit_fill=1.6)  # 0.7 x 1.6 overfills the frame; 0.35 x 1.6 fits
+    record = run_shot(renderer, request()).record
+    assert record["status"] == "ok"
+    attempts = bootstrap_attempts(record)
+    assert [f for f, _ in attempts] == pytest.approx([0.7, 0.35])
+    assert attempts[0][1].startswith("the model runs off the left") and attempts[1][1] is None
+    fitted = Camera.from_dict(record["zoom_to_fit_camera"])
+    assert Camera.from_dict(record["bootstrap"]["camera"]) == bootstrap_camera(fitted, 0.35)
+
+
+def test_several_unusable_bootstraps_before_success() -> None:
+    # 0.7 and 0.35 x 6 fill the whole frame (no background visible), 0.175 x 6 runs off
+    # the sides, 0.0875 x 6 fits.
+    record = run_shot(FakeRenderer(fit_fill=6.0), request()).record
+    attempts = bootstrap_attempts(record)
+    assert [p for _, p in attempts[:2]] == ["nothing is visible"] * 2
+    assert attempts[2][1].startswith("the model runs off")
+    assert attempts[3] == (pytest.approx(0.0875), None)
+    assert record["status"] == "ok" and record["attempts"][-1]["verification"]["ok"]
+
+
+def test_tight_bootstrap_without_room_to_calibrate_recovers() -> None:
+    # 0.7 x 1.36 leaves about 10 px either side in x: unclipped but too tight.
+    record = run_shot(FakeRenderer(fit_fill=1.36, fit_shift_m=0.0), request()).record
+    attempts = bootstrap_attempts(record)
+    assert attempts[0][1].startswith("the model is too close to the image edge to calibrate")
+    assert attempts[1][1] is None and record["status"] == "ok"
+
+
+def test_bootstrap_recovery_is_bounded() -> None:
+    # Too large for every allowed attempt: 0.7..0.0875 x 30 fill the whole frame and the
+    # last, 0.04375 x 30, is visible but still runs off the sides.
+    renderer = FakeRenderer(fit_fill=30.0)
+    with pytest.raises(ShotError) as info:
+        run_shot(renderer, request())
+    record = info.value.record
+    assert len(record["bootstrap_attempts"]) == BOOTSTRAP_MAX_ATTEMPTS
+    assert [a["factor"] for a in record["bootstrap_attempts"]] == pytest.approx(
+        [0.7 * 0.5**i for i in range(BOOTSTRAP_MAX_ATTEMPTS)]
+    )
+    assert len(renderer.applied) == BOOTSTRAP_MAX_ATTEMPTS  # nothing after the bootstrap
+    message = str(info.value)
+    assert message.startswith("found no usable starting view of the part after 5 attempts")
+    assert "Sides(" not in message
+    assert "the model runs off" in message
+    assert record["calibration"]["pilot"] == {}  # calibration never started
+    assert [a["problem"] for a in record["bootstrap_attempts"][:4]] == ["nothing is visible"] * 4
+
+
+def test_empty_bootstrap_fails_after_the_bounded_attempts() -> None:
+    with pytest.raises(ShotError, match="last attempt: nothing is visible") as info:
         run_shot(FakeRenderer(fit_shift_m=5.0), request())
+    assert [p for _, p in bootstrap_attempts(info.value.record)] == ["nothing is visible"] * 5
 
 
-def test_too_little_room_to_calibrate_fails() -> None:
-    with pytest.raises(ShotError, match="too little room to calibrate"):
-        # 0.7 x 1.36 fill leaves about 10 px either side in x: unclipped but too tight.
-        run_shot(renderer := FakeRenderer(fit_fill=1.36, fit_shift_m=0.0), request())
-    assert len(renderer.applied) == 1  # refused before any pilot capture
+def test_calibration_uses_the_accepted_bootstrap() -> None:
+    renderer = FakeRenderer(fit_fill=1.6)
+    record = run_shot(renderer, request()).record
+    boot = Camera.from_dict(record["bootstrap"]["camera"])
+    accepted = record["bootstrap_attempts"][-1]["measurement"]
+    assert record["bootstrap"]["measurement"] == accepted
+    for axis in ("x", "y"):
+        base_sample = record["calibration"]["result"][axis]["samples"][0]
+        assert base_sample["offset_m"] == 0.0 and base_sample["center"] == accepted["center"]
+    rejected = Camera.from_dict(record["bootstrap_attempts"][0]["camera"])
+    after_bootstrap = renderer.applied[len(record["bootstrap_attempts"]) :]
+    assert all(c.scale == boot.scale for c in after_bootstrap[:10])  # pilots use the accepted one
+    assert rejected not in after_bootstrap
+
+
+def test_bootstrap_attempts_are_recorded() -> None:
+    record = run_shot(FakeRenderer(fit_fill=1.6), request()).record
+    for attempt in record["bootstrap_attempts"]:
+        assert set(attempt) >= {"attempt", "factor", "camera", "problem", "measurement"}
+        Camera.from_dict(attempt["camera"])
+    assert record["bootstrap_attempts"][0]["measurement"]["clipped"] is True
+    json.dumps(record)
+
+
+def test_accepted_bootstrap_sets_the_background() -> None:
+    # The first attempt fills the frame, so its inferred "background" is the model colour;
+    # only the accepted attempt's background may become the reference.
+    record = run_shot(FakeRenderer(fit_fill=6.0), request()).record
+    first = record["bootstrap_attempts"][0]["measurement"]["background"]["color"]
+    assert first != [255, 255, 255]
+    assert record["background"] == [255, 255, 255]
+
+
+def test_calibration_room_rule() -> None:
+    assert not calibration_room_ok(17, 1200) and calibration_room_ok(18, 1200)
+    assert not calibration_room_ok(500, 100)  # 5 % of 100 px is too little movement
 
 
 @pytest.mark.parametrize("kx, ky", [(-5575.0, -5575.0), (5575.0, 5575.0)])
@@ -223,7 +315,7 @@ def test_impossible_margin_fails_as_a_shot_error() -> None:
 
 def test_failure_records_are_written(tmp_path: Path) -> None:
     with pytest.raises(ShotError) as info:
-        run_shot(FakeRenderer(fit_fill=1.6), request())
+        run_shot(FakeRenderer(fit_shift_m=5.0), request())
     path = tmp_path / "out" / "record.json"
     write_record(info.value.record, path)
     data = json.loads(path.read_text(encoding="utf-8"))

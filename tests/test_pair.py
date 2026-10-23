@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from fake_renderer import ORIENT, FakeRenderer
+from fakes import Preferences, preference_app
 from PIL import Image
 
 from viewjig import pair as pair_module
@@ -13,7 +14,8 @@ from viewjig.camera import Camera
 from viewjig.measure import combine, measure
 from viewjig.pair import MAX_SOLVES, PairError, PairRequest, pair, run_pair
 from viewjig.shot import bootstrap_camera
-from viewjig.sw import StandardView
+from viewjig.steps import BOOTSTRAP_MAX_ATTEMPTS
+from viewjig.sw import Com, StandardView
 
 # Projected model rectangles (qx0, qy0, qx1, qy1). In the fake, negative q_y extends down
 # the image, so TALL shares SHORT's left, right, and top (q_y = 0) edges and reaches lower.
@@ -180,8 +182,11 @@ def test_independent_backgrounds_that_agree_become_one_shared_reference() -> Non
 def test_background_disagreement_fails() -> None:
     opener, _a, b = world()
     b.background = (200, 220, 255)
-    with pytest.raises(PairError, match="bootstrap backgrounds differ"):
+    with pytest.raises(PairError, match="last attempt: the backgrounds differ") as info:
         run_pair(opener, request())
+    attempts = info.value.record["bootstrap_attempts"]
+    assert len(attempts) == BOOTSTRAP_MAX_ATTEMPTS
+    assert all(a["problem"].startswith("the backgrounds differ") for a in attempts)
 
 
 # --- Member checks ---------------------------------------------------------------------------
@@ -201,10 +206,10 @@ def test_a_member_lost_from_the_final_images_fails_even_if_the_combined_extent_f
         return image
 
     b.capture = vanish
-    with pytest.raises(PairError, match="b: no foreground") as info:
+    with pytest.raises(PairError, match="b: nothing is visible") as info:
         run_pair(opener, request())
     attempt = info.value.record["attempts"][-1]
-    assert attempt["member_failures"] == ["b: no foreground"]
+    assert attempt["member_failures"] == ["b: nothing is visible"]
     assert attempt["ok"] is False
     assert attempt["combined"]["bounds"] == attempt["measurements"]["a"]["bounds"]
 
@@ -223,15 +228,88 @@ def test_a_clipped_member_fails() -> None:
         return image
 
     b.capture = clip
-    with pytest.raises(PairError, match="b: foreground touches the image edge"):
+    with pytest.raises(PairError, match="b: the model runs off the top edge") as info:
         run_pair(opener, request())
+    assert "Sides(" not in str(info.value)
 
 
-def test_a_bootstrap_member_off_the_shared_frame_fails() -> None:
-    # Same size as A, so the fits tie and A starts the camera; B sits to the side of it.
+def test_a_member_off_the_shared_bootstrap_recovers_by_zooming_out() -> None:
+    # Same size as A, so the fits tie and A starts the camera; B sits to the side of it
+    # and runs off the frame until the shared camera zooms farther out.
     opener, _, _ = world(b_model=(0.06, -0.05, 0.18, 0.0))
-    with pytest.raises(PairError, match="bootstrap: b: (no foreground|foreground touches)"):
+    r = run_pair(opener, request()).record
+    attempts = r["bootstrap_attempts"]
+    assert attempts[0]["problem"].startswith("b: the model runs off")
+    assert attempts[-1]["problem"] is None and len(attempts) >= 2
+    assert r["status"] == "ok"
+
+
+def test_a_member_far_outside_the_frame_exhausts_the_bootstrap() -> None:
+    # The two fits are the same size, so either may start the camera; the other part
+    # stays out of view however far the shared camera zooms out.
+    opener, _, _ = world(b_model=(5.0, -0.05, 5.12, 0.0))
+    with pytest.raises(PairError, match="last attempt: (a|b): nothing is visible") as info:
         run_pair(opener, request())
+    message = str(info.value)
+    assert message.startswith("found no usable starting view of both parts after 5 attempts")
+    assert info.value.record["calibration"]["pilot"] == {}
+
+
+# --- Bootstrap recovery ----------------------------------------------------------------------
+
+
+def test_clipped_shared_bootstrap_recovers_for_both_members() -> None:
+    # At 0.7 the taller B fills the whole frame, so its inferred "background" is the model
+    # colour and disagrees with A's; zooming out to 0.35 shows both parts on white.
+    opener, a, b = world(fit_fill=1.6)
+    r = run_pair(opener, request()).record
+    attempts = r["bootstrap_attempts"]
+    assert [x["factor"] for x in attempts] == pytest.approx([0.7, 0.35])
+    assert attempts[0]["problem"].startswith("the backgrounds differ")
+    assert attempts[1]["problem"] is None
+    assert r["background"]["shared"] == [255, 255, 255]
+    boot = Camera.from_dict(r["bootstrap"]["camera"])
+    fit = Camera.from_dict(r["shared_start"]["camera"])
+    assert boot == bootstrap_camera(fit, 0.35)
+    # Both members were captured with every attempted camera, and calibrate around the accepted one.
+    for attempt in attempts:
+        camera = Camera.from_dict(attempt["camera"])
+        assert camera in a.applied and camera in b.applied
+    assert r["bootstrap"]["measurements"]["a"] == attempts[-1]["measurements"]["a"]
+    assert r["status"] == "ok" and r["final"]["readback_exact"] == {"a": True, "b": True}
+
+
+def test_first_shared_bootstrap_success_takes_one_attempt() -> None:
+    opener, _, _ = world()
+    r = run_pair(opener, request()).record
+    assert len(r["bootstrap_attempts"]) == 1 and r["bootstrap_attempts"][0]["problem"] is None
+    # fits (1 session each) + bootstrap (1 each) + calibration (1) + one per attempt each
+    sessions = r["documents"]["a"]["sessions"] + r["documents"]["b"]["sessions"]
+    assert sessions == 2 + 2 + 1 + 2 * len(r["attempts"])
+
+
+def test_pair_bootstrap_attempts_record_both_members() -> None:
+    opener, _, _ = world(fit_fill=1.6)
+    r = run_pair(opener, request()).record
+    rejected, accepted = r["bootstrap_attempts"]
+    assert set(rejected) >= {"attempt", "factor", "camera", "problem", "inferred"}
+    assert rejected["inferred"]["b"]["background"]["color"] == [194, 194, 194]
+    assert set(accepted["inferred"]) == {"a", "b"}
+    assert set(accepted["measurements"]) == {"a", "b"}
+    json.dumps(r)
+
+
+def test_pair_bootstrap_recovery_is_bounded() -> None:
+    # A's border stays mixed at every allowed zoom-out, so each attempt stops there
+    # without capturing B.
+    opener, a, b = world(fit_fill=30.0)
+    with pytest.raises(PairError, match="found no usable starting view of both parts") as info:
+        run_pair(opener, request())
+    attempts = info.value.record["bootstrap_attempts"]
+    assert len(attempts) == BOOTSTRAP_MAX_ATTEMPTS
+    assert all(x["problem"] == "a: the background could not be identified" for x in attempts)
+    assert len(a.applied) == BOOTSTRAP_MAX_ATTEMPTS and b.applied == []
+    assert opener.open_now == 0
 
 
 def test_mismatched_orientations_fail() -> None:
@@ -312,7 +390,7 @@ def test_unrelated_documents_with_no_shared_lines_still_pair() -> None:
 def test_successful_pair_writes_two_pngs_and_one_record(tmp_path: Path) -> None:
     opener, _, _ = world()
     paths = (tmp_path / "a.png", tmp_path / "b.png", tmp_path / "pair.json")
-    result = pair(request(), *paths, opener=opener)
+    result = pair(request(), *paths, app=Com(preference_app(Preferences())), opener=opener)
     assert all(p.is_file() for p in paths)
     data = json.loads(paths[2].read_text(encoding="utf-8"))
     assert data["status"] == "ok" and data["format"] == "viewjig.pair"
@@ -326,7 +404,7 @@ def test_failed_pair_writes_the_record_but_no_pngs(tmp_path: Path) -> None:
     b.background = (0, 0, 0)
     paths = (tmp_path / "a.png", tmp_path / "b.png", tmp_path / "pair.json")
     with pytest.raises(PairError):
-        pair(request(), *paths, opener=opener)
+        pair(request(), *paths, app=Com(preference_app(Preferences())), opener=opener)
     assert not paths[0].exists() and not paths[1].exists()
     data = json.loads(paths[2].read_text(encoding="utf-8"))
     assert data["status"] == "failed" and "backgrounds differ" in data["error"]
