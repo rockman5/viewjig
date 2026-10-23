@@ -1,3 +1,3 @@
-"""ViewJig: repeatable CAD image capture."""
+"""ViewJig: a repeatable camera jig for CAD."""
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"

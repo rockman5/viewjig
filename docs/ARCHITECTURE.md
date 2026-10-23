@@ -54,31 +54,32 @@ A matched capture is a set-level operation. All members share a framing target a
 
 ViewJig must not save or intentionally mutate source CAD files. Operations that require temporary state should be reversible, and source documents should be closed without saving.
 
-## Planned modules
+## Modules
 
 ```text
 src/viewjig/
-  session.py      SOLIDWORKS connection and COM helpers
-  documents.py    document lifecycle and source-safety guards
-  view.py         orientation and portable camera state
-  raster.py       fixed-size raster capture
-  measure.py      pixel-only foreground/framing measurement
-  framing.py      camera correction policy
-  matched.py      matched capture across two or more documents
-  export.py       output images and metadata
-  cli.py          `viewjig shot` and `viewjig pair`
+  sw.py        SOLIDWORKS boundary: explicit COM calls, attach, read-only document lifecycle
+  camera.py    plain-number camera (Orientation3, Translation3, Scale2): read, apply, JSON
+  raster.py    fixed-size capture through SaveBMP
+  measure.py   raster-only foreground measurement, combined extents, edge-overlap diagnostic
+  framing.py   pure math: pan calibration, one predicted correction, verification
+  steps.py     orchestration steps shared by shot and pair
+  shot.py      one document: bootstrap, calibrate, correct, verify, export
+  pair.py      two documents with one shared camera
+  cli.py       `viewjig shot` and `viewjig pair`
 ```
 
-The framing policy should be testable without SOLIDWORKS by depending on small camera/renderer interfaces. Synthetic renderers and generated images can exercise the control policy offline.
+Only `sw.py`, `camera.py`, and `raster.py` talk to SOLIDWORKS. `measure.py` and
+`framing.py` work on images and numbers alone. `shot.py` and `pair.py` drive
+SOLIDWORKS through a small renderer interface, so the whole sequence is tested
+offline with a fake renderer.
 
-## V1 commands
+## Commands
 
 ```text
-viewjig shot model.SLDPRT --view iso --size 1600x1200
-viewjig pair before.SLDPRT after.SLDPRT --view iso --size 1600x1200
+viewjig shot part.SLDPRT [--view isometric] [--width 1600] [--height 1200] [--margin PX] [--output PNG]
+viewjig pair before.SLDPRT after.SLDPRT [same options] [--output BASE]
 ```
-
-The exact CLI is provisional until the underlying capture path is characterized.
 
 ## Deliberate exclusions
 

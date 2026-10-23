@@ -4,18 +4,35 @@ build-backend = "hatchling.build"
 
 [project]
 name = "viewjig"
-version = "0.0.1"
-description = "Repeatable, perfectly matched SOLIDWORKS captures for design reviews and engineering presentations."
+version = "0.1.0"
+description = "A repeatable camera jig for SOLIDWORKS: framed, registered PNG captures of parts at fixed output sizes."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 license = { file = "LICENSE" }
 authors = [
   { name = "Andre Stone" }
 ]
+keywords = ["solidworks", "cad", "capture", "screenshot", "registration"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Manufacturing",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Graphics :: Capture :: Screen Capture",
+  "Topic :: Scientific/Engineering",
+]
+# ViewJig drives SOLIDWORKS through COM, so it runs on Windows with SOLIDWORKS installed.
+# pywin32 is only installable there; the pure modules and the offline tests do not need it.
 dependencies = [
   "Pillow>=10",
   "pywin32>=306; platform_system == 'Windows'",
 ]
+
+[project.urls]
+Repository = "https://github.com/rockman5/viewjig"
 
 [project.optional-dependencies]
 dev = [
