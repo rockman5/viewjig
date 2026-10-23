@@ -1,9 +1,10 @@
 """Command-line entry point: ``viewjig shot`` and ``viewjig pair``.
 
 Arguments are validated before SOLIDWORKS is touched. Expected operational
-failures (a ``ShotError`` or ``PairError``) print a short message and the path of
-the JSON record that explains them, and exit with status 1; usage errors exit
-with status 2.
+failures (a ``ShotError`` or ``PairError``) print what failed, a next step where
+one is known, that the part files were not modified, whether any temporary
+SOLIDWORKS setting was restored, and the path of the JSON record; they exit with
+status 1. Usage errors exit with status 2.
 """
 
 from __future__ import annotations
@@ -17,7 +18,14 @@ from typing import Any
 from viewjig import __version__
 from viewjig.pair import PairError, PairRequest, pair
 from viewjig.shot import ShotError, ShotRequest, resolve_margin, shoot
-from viewjig.sw import StandardView
+from viewjig.steps import CaptureError
+from viewjig.sw import (
+    DocumentAlreadyOpen,
+    DocumentNotReadOnly,
+    DocumentOpenFailed,
+    SolidWorksNotRunning,
+    StandardView,
+)
 
 DEFAULT_WIDTH = 1600
 DEFAULT_HEIGHT = 1200
@@ -179,6 +187,74 @@ def _margin_text(record: dict[str, Any]) -> str:
     return f"{margin['px']} px" + (" (5% default)" if margin["source"] == "default" else "")
 
 
+def _causes(exc: BaseException) -> list[BaseException]:
+    chain, current = [], exc.__cause__ or exc.__context__
+    while current is not None and current not in chain:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _headline(exc: CaptureError) -> str:
+    """What failed, in the underlying error's own words (no internal class names)."""
+    for cause in _causes(exc):
+        if not isinstance(cause, CaptureError):
+            return str(cause)
+    return str(exc)
+
+
+# Next steps only for failures with a clear user action.
+NEXT_STEPS = (
+    (SolidWorksNotRunning, "Start SOLIDWORKS, then run the command again."),
+    (DocumentAlreadyOpen, "Close it in SOLIDWORKS, then run the command again."),
+    (DocumentNotReadOnly, "Close it in SOLIDWORKS, then run the command again."),
+    (DocumentOpenFailed, "Check that SOLIDWORKS can open it on its own."),
+)
+
+
+def _next_step(exc: CaptureError) -> str | None:
+    for cause in _causes(exc):
+        for kind, advice in NEXT_STEPS:
+            if isinstance(cause, kind):
+                return advice
+    return None
+
+
+def _settings_text(record: dict[str, Any]) -> str:
+    """Whether the temporary capture environment (application and document scenes) was undone."""
+    environment = record.get("capture_environment") or {}
+    application = environment.get("application")
+    documents = (environment.get("documents") or {}).values()
+    changed, restored = False, True
+    if application is not None:
+        changed = bool(application.get("temporarily_switched_to_document_scene"))
+        if changed or application.get("restored") is False:
+            restored = application.get("restored") is True
+    for document in documents:  # a document is listed only once its scene was made white
+        changed = True
+        restored = restored and document.get("all_restored") is True
+    if not restored:
+        return "could NOT be fully restored; see the message above."
+    return "restored." if changed else "unchanged."
+
+
+def _report_failure(command: str, exc: CaptureError, record_path: Path) -> int:
+    lines = [f"viewjig {command} failed: {_headline(exc)}"]
+    if (advice := _next_step(exc)) is not None:
+        lines.append(f"  Next: {advice}")
+    lines.append(
+        "  Your part files were not modified (ViewJig opens them read-only and never saves)."
+    )
+    lines.append(f"  SOLIDWORKS settings: {_settings_text(exc.record)}")
+    lines.append(f"  Details: {record_path.resolve()}")
+    print("\n".join(lines), file=sys.stderr)
+    return EXIT_FAILED
+
+
+def _record_line(record_path: Path) -> str:
+    return f"  record: {record_path.resolve()}"
+
+
 def run_shot_command(args: argparse.Namespace) -> int:
     png, record_path = shot_paths(args)
     request = ShotRequest(
@@ -191,15 +267,13 @@ def run_shot_command(args: argparse.Namespace) -> int:
     try:
         result = shoot(request, png, record_path)
     except ShotError as exc:
-        print(f"viewjig shot failed: {exc}", file=sys.stderr)
-        print(f"  record: {record_path}", file=sys.stderr)
-        return EXIT_FAILED
+        return _report_failure("shot", exc, record_path)
     r = result.record
-    print(f"viewjig shot: {png}")
-    print(f"  record: {record_path}")
+    print(f"viewjig shot: {png.resolve()}")
     print(
         f"  {args.view}, {args.width}x{args.height}, margin {_margin_text(r)}, {_attempt_summary(r)}"
     )
+    print(_record_line(record_path))
     return EXIT_OK
 
 
@@ -216,18 +290,16 @@ def run_pair_command(args: argparse.Namespace) -> int:
     try:
         result = pair(request, before_png, after_png, record_path)
     except PairError as exc:
-        print(f"viewjig pair failed: {exc}", file=sys.stderr)
-        print(f"  record: {record_path}", file=sys.stderr)
-        return EXIT_FAILED
+        return _report_failure("pair", exc, record_path)
     r = result.record
     exact = r["final"]["readback_exact"]
-    print(f"viewjig pair: {before_png}")
-    print(f"              {after_png}")
-    print(f"  record: {record_path}")
+    print(f"viewjig pair: {before_png.resolve()}")
+    print(f"              {after_png.resolve()}")
     print(
         f"  {args.view}, {args.width}x{args.height}, margin {_margin_text(r)}, {_attempt_summary(r)}"
     )
     print(f"  one shared camera, read back exactly on both: {exact['a'] and exact['b']}")
+    print(_record_line(record_path))
     return EXIT_OK
 
 

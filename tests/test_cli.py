@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from viewjig import cli, sw
+from viewjig.environment import EnvironmentRestoreError
 from viewjig.pair import PairError
 from viewjig.shot import ShotError
 from viewjig.steps import write_record
@@ -187,60 +188,117 @@ def test_no_command_prints_help_and_exits_2(capsys) -> None:
 # --- Output ------------------------------------------------------------------------------------
 
 
-def test_successful_shot_output_is_concise(parts, calls, capsys) -> None:
+def test_successful_shot_output_is_concise_and_absolute(parts, calls, capsys) -> None:
     cli.main(["shot", str(parts[0])])
-    out = capsys.readouterr().out
-    assert "vj-f01-isometric-1600x1200.png" in out and "vj-f01-isometric-1600x1200.json" in out
-    assert "isometric, 1600x1200, margin 60 px (5% default), 1 correction" in out
-    assert "verified within 3.0 px (worst side 1.2 px)" in out
-    assert "{" not in out and len(out.splitlines()) == 3
+    lines = capsys.readouterr().out.splitlines()
+    png = (Path.cwd() / "vj-f01-isometric-1600x1200.png").resolve()
+    assert lines[0] == f"viewjig shot: {png}"
+    assert "isometric, 1600x1200, margin 60 px (5% default), 1 correction" in lines[1]
+    assert "verified within 3.0 px (worst side 1.2 px)" in lines[1]
+    assert lines[2] == f"  record: {png.with_suffix('.json')}"
+    assert len(lines) == 3 and not any("{" in line for line in lines)
 
 
-def test_successful_pair_output_is_concise(parts, calls, capsys) -> None:
+def test_successful_pair_output_is_concise_and_absolute(parts, calls, capsys) -> None:
     cli.main(["pair", str(parts[0]), str(parts[1]), "--margin", "40"])
-    out = capsys.readouterr().out
-    assert "-before.png" in out and "-after.png" in out and ".json" in out
-    assert "2 corrections" in out
-    assert "one shared camera, read back exactly on both: True" in out
-    assert "{" not in out and len(out.splitlines()) == 5
+    lines = capsys.readouterr().out.splitlines()
+    base = (Path.cwd() / "vj-f01-vs-vj-f01b-isometric-1600x1200").resolve()
+    assert lines[0] == f"viewjig pair: {base}-before.png"
+    assert lines[1].strip() == f"{base}-after.png"
+    assert "2 corrections" in lines[2]
+    assert lines[3] == "  one shared camera, read back exactly on both: True"
+    assert lines[4] == f"  record: {base}.json"
+    assert len(lines) == 5 and not any("{" in line for line in lines)
+
+
+def test_explicit_output_paths_are_shown_absolute(parts, calls, capsys) -> None:
+    cli.main(["shot", str(parts[0]), "--output", "slides/front.png"])
+    first = capsys.readouterr().out.splitlines()[0]
+    assert first == f"viewjig shot: {(Path.cwd() / 'slides' / 'front.png').resolve()}"
 
 
 # --- Operational failures ------------------------------------------------------------------------
 
 
-def test_shot_failure_exits_1_with_record_and_no_traceback(
+def failure_lines(err: str) -> list[str]:
+    assert "Traceback" not in err
+    return err.splitlines()
+
+
+def test_shot_failure_explains_itself_and_keeps_the_record(
     parts, solidworks_not_running, capsys
 ) -> None:
     assert cli.main(["shot", str(parts[0])]) == 1
     captured = capsys.readouterr()
-    assert "viewjig shot failed: SolidWorksNotRunning" in captured.err
-    assert "record: vj-f01-isometric-1600x1200.json" in captured.err
-    assert "Traceback" not in captured.err and captured.out == ""
-    record = json.loads(Path("vj-f01-isometric-1600x1200.json").read_text(encoding="utf-8"))
-    assert record["status"] == "failed" and "not running" in record["error"]
+    record_path = (Path.cwd() / "vj-f01-isometric-1600x1200.json").resolve()
+    assert failure_lines(captured.err) == [
+        "viewjig shot failed: SOLIDWORKS is not running",
+        "  Next: Start SOLIDWORKS, then run the command again.",
+        "  Your part files were not modified (ViewJig opens them read-only and never saves).",
+        "  SOLIDWORKS settings: unchanged.",
+        f"  Details: {record_path}",
+    ]
+    assert captured.out == ""
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["status"] == "failed"
+    assert record["error"] == "SolidWorksNotRunning: SOLIDWORKS is not running"  # full detail kept
     assert not Path("vj-f01-isometric-1600x1200.png").exists()
 
 
-def test_pair_failure_exits_1_with_record_and_no_traceback(
+def test_pair_failure_explains_itself_and_keeps_the_record(
     parts, solidworks_not_running, capsys
 ) -> None:
     assert cli.main(["pair", str(parts[0]), str(parts[1])]) == 1
-    captured = capsys.readouterr()
+    lines = failure_lines(capsys.readouterr().err)
     base = "vj-f01-vs-vj-f01b-isometric-1600x1200"
-    assert "viewjig pair failed" in captured.err and f"record: {base}.json" in captured.err
-    assert "Traceback" not in captured.err
+    assert lines[0] == "viewjig pair failed: SOLIDWORKS is not running"
+    assert lines[-1] == f"  Details: {(Path.cwd() / f'{base}.json').resolve()}"
     assert json.loads(Path(f"{base}.json").read_text(encoding="utf-8"))["status"] == "failed"
     assert not Path(f"{base}-before.png").exists() and not Path(f"{base}-after.png").exists()
 
 
-def test_framing_failures_are_reported_from_the_record(parts, monkeypatch, capsys) -> None:
+def raising(error: Exception, record: dict | None = None):
+    """A shoot replacement that fails the way shoot() does: ShotError chained from ``error``."""
+
+    def failing_shoot(request, png, record_path):
+        full = {"status": "failed", "error": f"{type(error).__name__}: {error}", **(record or {})}
+        write_record(full, record_path)
+        raise ShotError(full["error"], full) from error
+
+    return failing_shoot
+
+
+@pytest.mark.parametrize(
+    "error, next_step",
+    [
+        (sw.SolidWorksNotRunning("SOLIDWORKS is not running"), "Start SOLIDWORKS"),
+        (sw.DocumentAlreadyOpen("vj-f01.SLDPRT is already open in SOLIDWORKS"), "Close it"),
+        (sw.DocumentNotReadOnly("vj-f01.SLDPRT is open for editing in SOLIDWORKS"), "Close it"),
+        (
+            sw.DocumentOpenFailed("OpenDoc6 failed for vj-f01.SLDPRT (errors=2, warnings=0)"),
+            "Check that SOLIDWORKS can open it on its own.",
+        ),
+    ],
+)
+def test_known_failures_get_a_next_step(parts, monkeypatch, capsys, error, next_step) -> None:
+    monkeypatch.setattr(cli, "shoot", raising(error))
+    assert cli.main(["shot", str(parts[0])]) == 1
+    lines = failure_lines(capsys.readouterr().err)
+    assert lines[0] == f"viewjig shot failed: {error}"  # no internal class name
+    assert lines[1].startswith("  Next: ") and next_step in lines[1]
+
+
+def test_other_failures_get_no_invented_advice(parts, monkeypatch, capsys) -> None:
     def failing_shoot(request, png, record_path):
         record = {"status": "failed", "error": "framing still outside tolerance after 2 solves"}
         write_record(record, record_path)
         raise ShotError(record["error"], record)
 
     def failing_pair(request, png_a, png_b, record_path):
-        record = {"status": "failed", "error": "attempt 1 is not measurable: ['b: no foreground']"}
+        record = {
+            "status": "failed",
+            "error": "attempt 1 is not measurable: ['b: nothing is visible']",
+        }
         write_record(record, record_path)
         raise PairError(record["error"], record)
 
@@ -249,7 +307,77 @@ def test_framing_failures_are_reported_from_the_record(parts, monkeypatch, capsy
     assert cli.main(["shot", str(parts[0])]) == 1
     assert cli.main(["pair", str(parts[0]), str(parts[1])]) == 1
     err = capsys.readouterr().err
-    assert "after 2 solves" in err and "b: no foreground" in err and "Traceback" not in err
+    assert "after 2 solves" in err and "b: nothing is visible" in err
+    assert "Next:" not in err and "Traceback" not in err
+    assert err.count("Your part files were not modified") == 2
+
+
+UNSWITCHED = {"temporarily_switched_to_document_scene": False, "restored": True}
+SWITCHED = {"temporarily_switched_to_document_scene": True, "restored": True}
+NOT_RESTORED = {"temporarily_switched_to_document_scene": True, "restored": False}
+SCENE_RESTORED = {"vj-f01.SLDPRT": {"sessions": 2, "all_restored": True}}
+SCENE_NOT_RESTORED = {"vj-f01.SLDPRT": {"sessions": 2, "all_restored": False}}
+UNFULLY = "could NOT be fully restored; see the message above."
+
+
+@pytest.mark.parametrize(
+    "application, documents, expected",
+    [
+        (None, {}, "unchanged."),
+        (UNSWITCHED, {}, "unchanged."),
+        (SWITCHED, {}, "restored."),
+        (UNSWITCHED, SCENE_RESTORED, "restored."),  # document scene only
+        (SWITCHED, SCENE_RESTORED, "restored."),  # application and document scene
+        (NOT_RESTORED, SCENE_RESTORED, UNFULLY),
+        (UNSWITCHED, SCENE_NOT_RESTORED, UNFULLY),  # document restoration failed
+        (SWITCHED, SCENE_NOT_RESTORED, UNFULLY),
+        (None, SCENE_NOT_RESTORED, UNFULLY),
+        ({**UNSWITCHED, "restored": False}, {}, UNFULLY),  # a check failed without a switch
+    ],
+)
+def test_failure_reports_the_settings_state(
+    parts, monkeypatch, capsys, application, documents, expected
+):
+    record = {
+        "capture_environment": {
+            "background": "plain white",
+            "application": application,
+            "documents": documents,
+        }
+    }
+    monkeypatch.setattr(cli, "shoot", raising(RuntimeError("capture failed"), record))
+    assert cli.main(["shot", str(parts[0])]) == 1
+    lines = failure_lines(capsys.readouterr().err)
+    assert f"  SOLIDWORKS settings: {expected}" in lines
+
+
+def test_restore_failure_message_leads(parts, monkeypatch, capsys) -> None:
+    error = EnvironmentRestoreError(
+        "ViewJig could not restore the SOLIDWORKS background setting (System Options > Colors > "
+        "Background appearance): it should be Gradient (1) but is Use document scene background "
+        "(3). Please set it back in System Options."
+    )
+    record = {
+        "capture_environment": {
+            "application": {"temporarily_switched_to_document_scene": True, "restored": False}
+        }
+    }
+    monkeypatch.setattr(cli, "shoot", raising(error, record))
+    cli.main(["shot", str(parts[0])])
+    lines = failure_lines(capsys.readouterr().err)
+    assert lines[0].startswith("viewjig shot failed: ViewJig could not restore")
+    assert "Please set it back in System Options." in lines[0]
+    assert lines[2] == f"  SOLIDWORKS settings: {UNFULLY}"
+
+
+# --- Packaging ---------------------------------------------------------------------------------
+
+
+def test_the_viewjig_command_is_installed() -> None:
+    from importlib.metadata import entry_points
+
+    (script,) = entry_points(group="console_scripts", name="viewjig")
+    assert script.value == "viewjig.cli:main"
 
 
 def test_version_flag(capsys) -> None:

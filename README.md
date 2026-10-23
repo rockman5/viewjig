@@ -39,27 +39,36 @@ the verification, so a result can be checked and reproduced.
 
 SOLIDWORKS must already be running. ViewJig attaches to it, opens each part
 read-only, and closes it again. It never saves or edits your files, and it
-refuses to touch a part that is already open.
+refuses to touch a part that is already open. Whatever background you use in
+SOLIDWORKS, ViewJig captures on plain white and puts your settings back
+afterwards.
+
+The examples use `viewjig`. If you followed [Installation](#installation)
+without adding ViewJig to your `PATH`, type `.venv\Scripts\viewjig.exe` (from
+the ViewJig folder) instead.
 
 Capture one part:
 
 ```console
 > viewjig shot bracket.SLDPRT
-viewjig shot: bracket-isometric-1600x1200.png
-  record: bracket-isometric-1600x1200.json
+viewjig shot: C:\Users\you\Documents\renders\bracket-isometric-1600x1200.png
   isometric, 1600x1200, margin 60 px (5% default), 1 correction, verified within 3.0 px (worst side 1.0 px)
+  record: C:\Users\you\Documents\renders\bracket-isometric-1600x1200.json
 ```
 
 Capture a matched pair:
 
 ```console
 > viewjig pair bracket-rev1.SLDPRT bracket-rev2.SLDPRT
-viewjig pair: bracket-rev1-vs-bracket-rev2-isometric-1600x1200-before.png
-              bracket-rev1-vs-bracket-rev2-isometric-1600x1200-after.png
-  record: bracket-rev1-vs-bracket-rev2-isometric-1600x1200.json
+viewjig pair: C:\Users\you\Documents\renders\bracket-rev1-vs-bracket-rev2-isometric-1600x1200-before.png
+              C:\Users\you\Documents\renders\bracket-rev1-vs-bracket-rev2-isometric-1600x1200-after.png
   isometric, 1600x1200, margin 60 px (5% default), 1 correction, verified within 3.0 px (worst side 1.1 px)
   one shared camera, read back exactly on both: True
+  record: C:\Users\you\Documents\renders\bracket-rev1-vs-bracket-rev2-isometric-1600x1200.json
 ```
+
+The images are saved in the folder you run the command from, unless you give
+`--output`. ViewJig prints the full paths of the images and of their JSON record.
 
 The pair is framed so that **both** parts fit, with the margin applied to
 their combined extent.
@@ -84,10 +93,23 @@ Run `viewjig shot --help` or `viewjig pair --help` for details.
 
 ### When something goes wrong
 
-If ViewJig can't produce a verified result, for example because SOLIDWORKS
-isn't running, the background isn't plain, or the part runs off the frame, it
-prints a short reason and the path of the JSON record explaining what
-happened, then exits with status 1. It writes no image in that case. Invalid
+If ViewJig can't produce a verified result, it writes no image, exits with
+status 1, and says what happened:
+
+```console
+> viewjig shot bracket.SLDPRT
+viewjig shot failed: bracket.SLDPRT is already open in SOLIDWORKS
+  Next: Close it in SOLIDWORKS, then run the command again.
+  Your part files were not modified (ViewJig opens them read-only and never saves).
+  SOLIDWORKS settings: unchanged.
+  Details: C:\Users\you\Documents\renders\bracket-isometric-1600x1200.json
+```
+
+A `Next:` line appears when there is something specific to do: start
+SOLIDWORKS, close a part that is already open, or check that SOLIDWORKS can open
+the file. The settings line says whether ViewJig had temporarily changed the
+SOLIDWORKS background (the application setting or the part's scene) and whether
+every change was put back. The JSON record holds the full details. Invalid
 arguments exit with status 2 before SOLIDWORKS is touched.
 
 ## Installation
@@ -95,27 +117,41 @@ arguments exit with status 2 before SOLIDWORKS is touched.
 Requirements:
 
 - Windows with SOLIDWORKS installed (developed and tested with SOLIDWORKS 2026 SP4)
-- Python 3.14 or later
+- Python 3.14 or later, from [python.org](https://www.python.org/downloads/windows/)
+  (its installer includes the `py` launcher used below)
+
+Get ViewJig with `git clone https://github.com/rockman5/viewjig`, or download
+the repository as a ZIP from GitHub and extract it. Then, in the ViewJig folder:
 
 ```console
-> git clone https://github.com/rockman5/viewjig
-> cd viewjig
-> python -m venv .venv
-> .venv\Scripts\activate
-> pip install -e .
+> py -3.14 -m venv .venv
+> .venv\Scripts\python.exe -m pip install .
+> .venv\Scripts\viewjig.exe --help
 ```
 
-This installs the `viewjig` command and its dependencies (Pillow and pywin32).
-`python -m viewjig` works too.
+This installs ViewJig and its dependencies (Pillow and pywin32) into the
+`.venv` folder. You don't need to activate the environment: run
+`.venv\Scripts\viewjig.exe` directly, from any folder if you give its full path.
+
+To type just `viewjig` in any terminal, add the full path of the ViewJig
+folder's `.venv\Scripts` to your user `PATH` environment variable.
+
+**Updating:** if you used `git clone`, run `git pull` in the ViewJig folder,
+then `.venv\Scripts\python.exe -m pip install .` again. If you used a ZIP,
+download and extract the new version to a new folder and install from there,
+following the steps above.
+
+**Developing ViewJig:** install it editable with the test tools instead:
+`.venv\Scripts\python.exe -m pip install -e ".[dev]"`.
 
 ## Scope (V1)
 
 - **Files:** SOLIDWORKS parts (`.SLDPRT`).
 - **Views:** Isometric and Front, the two standard views validated against
   live SOLIDWORKS.
-- **Display:** an orthographic view on a plain (single-colour) background, such
-  as the default Shaded with Edges on white. ViewJig measures the image
-  against the background colour and stops if the background isn't plain.
+- **Display:** orthographic views. ViewJig captures on a plain white background
+  whatever background SOLIDWORKS normally shows, then restores your settings
+  (see the JSON record's `capture_environment`).
 - **Output:** PNG at exactly the requested size, framed to within 3 px of the
   target margin on every side.
 
@@ -136,7 +172,20 @@ camera is applied identically to each.
 
 ## The JSON record
 
-Each record contains:
+The PNG is the result. The JSON record beside it is the complete engineering
+and reproducibility record of how that image was made. You don't need it for
+normal use, and it is long by design.
+
+The fields worth knowing:
+
+- `status` is `ok` or `failed`, and `error` says why a capture failed;
+- `output` lists the image files that were written;
+- `final.camera` records, as plain numbers, the camera that produced the final
+  framing;
+- `capture_environment` says which SOLIDWORKS settings ViewJig changed
+  temporarily, and confirms they were restored.
+
+In full, each record contains:
 
 - the input path(s), view, output size, and the margin with whether it was the
   default or explicit;
@@ -153,8 +202,6 @@ Each record contains:
   that each read back the same camera, and an edge-overlap check of the two
   images. The edge-overlap check is a diagnostic only and never affects the
   result.
-
-A camera in the record can be applied again to reproduce the same framing.
 
 ## Boundaries
 
