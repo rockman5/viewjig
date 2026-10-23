@@ -15,8 +15,10 @@ other is used.
 3. Capture both documents with that one bootstrap camera. Each background is
    inferred independently; they must agree within the threshold, and A's then
    becomes the single classification reference for every later capture.
-4. Both bootstrap foregrounds must be non-empty and clear of every edge. From here
-   on, framing uses their combined extent.
+4. Both bootstrap foregrounds must be fully in view, and one must leave room to
+   calibrate; otherwise the camera zooms farther out and both are captured again
+   (``steps.find_bootstrap``, bounded). From here on, framing uses their combined
+   extent.
 5. Calibrate the shared camera on the member with more room to move, with the
    SOLIDWORKS signs required, then restore the bootstrap camera.
 6. Solve from the combined extent; apply the solved camera to each document,
@@ -39,18 +41,34 @@ from PIL import Image
 
 from viewjig import framing, sw
 from viewjig.camera import Camera
-from viewjig.measure import Extent, Measurement, combine, edge_overlap, measure
+from viewjig.environment import (
+    ApplicationBackground,
+    DocumentBackground,
+    application_background,
+)
+from viewjig.measure import (
+    BackgroundUncertain,
+    Extent,
+    Measurement,
+    combine,
+    edge_overlap,
+    measure,
+)
 from viewjig.steps import (
     CAPTURE_ERRORS,
     MAX_SOLVES,
     CaptureError,
     Renderer,
-    bootstrap_camera,
     calibrate_around,
     calibration_room,
     constants,
+    environment_record,
+    failure_record,
+    find_bootstrap,
     open_renderer,
     resolve_margin,
+    room_problem,
+    visibility_problem,
     write_record,
 )
 from viewjig.sw import StandardView
@@ -105,12 +123,18 @@ class _Pair:
         with self.opener(self.paths[member]) as renderer:
             yield renderer
 
-    def shoot(
+    def capture(
         self, renderer: Renderer, member: str, camera: Camera
-    ) -> tuple[Image.Image, Measurement, Camera]:
+    ) -> tuple[Image.Image, Camera]:
         readback = renderer.apply_camera(camera)
         image = renderer.capture(self.request.width, self.request.height)
         self.record["documents"][member]["captures"] += 1
+        return image, readback
+
+    def shoot(
+        self, renderer: Renderer, member: str, camera: Camera
+    ) -> tuple[Image.Image, Measurement, Camera]:
+        image, readback = self.capture(renderer, member, camera)
         m = measure(image, self.request.threshold, background=self.background)
         return image, m, readback
 
@@ -152,13 +176,66 @@ def run_pair(opener: Opener, request: PairRequest) -> PairResult:
 
 
 def _member_failures(measurements: dict[str, Measurement]) -> list[str]:
-    failures = []
-    for member, m in measurements.items():
-        if m.is_empty:
-            failures.append(f"{member}: no foreground")
-        elif m.clipped:
-            failures.append(f"{member}: foreground touches the image edge {m.touches_edge}")
-    return failures
+    return [
+        f"{member}: {problem}"
+        for member, m in measurements.items()
+        if (problem := visibility_problem(m)) is not None
+    ]
+
+
+@dataclass
+class _Bootstrap:
+    """What the accepted bootstrap attempt established."""
+
+    readbacks: dict[str, Camera] | None = None
+    inferred: dict[str, Measurement] | None = None
+    colors: dict[str, tuple[int, int, int]] | None = None
+    base: dict[str, Measurement] | None = None
+    room: dict[str, int] | None = None
+    member: str | None = None
+
+
+def _try_bootstrap(
+    pair: _Pair, camera: Camera, accepted: _Bootstrap
+) -> tuple[str | None, dict[str, Any]]:
+    """Capture both documents with ``camera``; return ``(problem, details)``."""
+    request = pair.request
+    images: dict[str, Image.Image] = {}
+    readbacks: dict[str, Camera] = {}
+    inferred: dict[str, Measurement] = {}
+    details: dict[str, Any] = {"inferred": {}}
+    for member in MEMBERS:
+        with pair.session(member) as renderer:
+            images[member], readbacks[member] = pair.capture(renderer, member, camera)
+        try:
+            inferred[member] = measure(images[member], request.threshold)
+        except BackgroundUncertain as exc:
+            details["inferred"][member] = {"error": str(exc)}
+            return f"{member}: the background could not be identified", details
+        details["inferred"][member] = inferred[member].to_dict()
+    colors = {m: v.background.color for m, v in inferred.items()}
+    disagreement = max(abs(p - q) for p, q in zip(colors["a"], colors["b"], strict=True))
+    if disagreement > request.threshold:
+        return (
+            f"the backgrounds differ (a {colors['a']}, b {colors['b']}, "
+            f"difference {disagreement} > threshold {request.threshold})"
+        ), details
+    try:
+        base = {m: measure(images[m], request.threshold, background=colors["a"]) for m in MEMBERS}
+    except BackgroundUncertain as exc:
+        return "the shared background could not be confirmed", {**details, "error": str(exc)}
+    details["measurements"] = {m: v.to_dict() for m, v in base.items()}
+    failures = _member_failures(base)
+    if failures:
+        return "; ".join(failures), details
+    room = {m: min(calibration_room(base[m], "x"), calibration_room(base[m], "y")) for m in MEMBERS}
+    member = "a" if room["a"] >= room["b"] else "b"
+    problem = room_problem(base[member], min(request.width, request.height))
+    if problem is not None:
+        return problem, details
+    accepted.readbacks, accepted.inferred, accepted.colors = readbacks, inferred, colors
+    accepted.base, accepted.room, accepted.member = base, room, member
+    return None, details
 
 
 def _run(pair: _Pair, margin: int) -> PairResult:
@@ -182,44 +259,36 @@ def _run(pair: _Pair, margin: int) -> PairResult:
             "a shared camera needs the same orientation"
         )
 
-    # 2. Shared starting camera: the farther-out fit.
+    # 2-4. Shared bootstrap: the farther-out fit, shrunk, and zoomed out further while
+    # needed, until both parts are fully in view against agreeing backgrounds and one
+    # of them leaves room to calibrate.
     start_member = "a" if fits["a"].scale <= fits["b"].scale else "b"
-    boot = bootstrap_camera(fits[start_member])
     record["shared_start"] = {"member": start_member, "camera": fits[start_member].to_dict()}
-
-    # 3-4. Bootstrap both with the same camera; agree one background.
-    images: dict[str, Image.Image] = {}
-    inferred: dict[str, Measurement] = {}
-    readbacks: dict[str, Camera] = {}
-    for member in MEMBERS:
-        with pair.session(member) as renderer:
-            images[member], inferred[member], readbacks[member] = pair.shoot(renderer, member, boot)
+    accepted = _Bootstrap()
+    record["bootstrap_attempts"] = []
+    boot = find_bootstrap(
+        fits[start_member],
+        lambda camera: _try_bootstrap(pair, camera, accepted),
+        record["bootstrap_attempts"],
+        pair.fail,
+        "both parts",
+    )
+    base, colors, room, cal_member = accepted.base, accepted.colors, accepted.room, accepted.member
+    pair.background = colors["a"]
+    record["background"] = {
+        "inferred": {m: list(c) for m, c in colors.items()},
+        "shared": list(pair.background),
+    }
+    combined = combine(base.values())
     record["bootstrap"] = {
         "camera": boot.to_dict(),
-        "readback": {m: c.to_dict() for m, c in readbacks.items()},
-        "inferred": {m: v.to_dict() for m, v in inferred.items()},
+        "readback": {m: c.to_dict() for m, c in accepted.readbacks.items()},
+        "inferred": {m: v.to_dict() for m, v in accepted.inferred.items()},
+        "measurements": {m: v.to_dict() for m, v in base.items()},
+        "combined": combined.to_dict(),
     }
-    colors = {m: v.background.color for m, v in inferred.items()}
-    record["background"] = {"inferred": {m: list(c) for m, c in colors.items()}}
-    disagreement = max(abs(p - q) for p, q in zip(colors["a"], colors["b"], strict=True))
-    if disagreement > request.threshold:
-        raise pair.fail(
-            f"bootstrap backgrounds differ: a {colors['a']}, b {colors['b']} "
-            f"(difference {disagreement} > threshold {request.threshold})"
-        )
-    pair.background = colors["a"]
-    record["background"]["shared"] = list(pair.background)
-    base = {m: measure(images[m], request.threshold, background=pair.background) for m in MEMBERS}
-    record["bootstrap"]["measurements"] = {m: v.to_dict() for m, v in base.items()}
-    failures = _member_failures(base)
-    if failures:
-        raise pair.fail(f"bootstrap: {'; '.join(failures)}")
-    combined = combine(base.values())
-    record["bootstrap"]["combined"] = combined.to_dict()
 
     # 5. Calibrate on the member with more room to move, then restore the bootstrap.
-    room = {m: min(calibration_room(base[m], "x"), calibration_room(base[m], "y")) for m in MEMBERS}
-    cal_member = "a" if room["a"] >= room["b"] else "b"
     record["calibration"]["member"] = cal_member
     record["calibration"]["room_px"] = room
     with pair.session(cal_member) as renderer:
@@ -301,30 +370,42 @@ def pair(
     png_b: Path,
     record_path: Path,
     *,
+    app: sw.Com | None = None,
     opener: Opener | None = None,
 ) -> PairResult:
-    """Run a pair against the running SOLIDWORKS (or ``opener``) and export it.
+    """Run a pair against the running SOLIDWORKS and export it.
+
+    The whole pair runs inside one controlled-background application environment
+    (``application_background``); every document session gets its own plain white
+    scene, restored before it closes (``open_renderer``).
 
     Writes the JSON record whether or not the pair succeeds; writes the two PNGs
-    only on success.
+    only on success, with every setting restored. ``app`` and ``opener`` replace the
+    SOLIDWORKS connection and document opener (used by tests).
     """
+    record: dict[str, Any] = {"format": RECORD_FORMAT, "version": RECORD_VERSION}
+    app_env: ApplicationBackground | None = None
+    documents: list[DocumentBackground] = []
     try:
-        if opener is None:
+        if app is None:
             app = sw.attach()
+        if opener is None:
+            connected = app
 
             def opener(path: Path) -> AbstractContextManager[Renderer]:
-                return open_renderer(app, path)
+                return open_renderer(connected, path, documents)
 
-        result = run_pair(opener, request)
-    except PairError as exc:
-        write_record(exc.record, record_path)
-        raise
-    except sw.SolidWorksError as exc:  # attaching failed: nothing has run yet
-        record = {"format": RECORD_FORMAT, "version": RECORD_VERSION, "status": "failed"}
-        record["error"] = f"{type(exc).__name__}: {exc}"
+        with application_background(app) as app_env:
+            result = run_pair(opener, request)
+            record = result.record
+    except (PairError, sw.SolidWorksError) as exc:
+        record = failure_record(exc, record)
+        record["capture_environment"] = environment_record(app_env, documents)
         write_record(record, record_path)
+        if isinstance(exc, PairError):
+            raise
         raise PairError(record["error"], record) from exc
-    record = result.record
+    record["capture_environment"] = environment_record(app_env, documents)
     for member, path in (("a", png_a), ("b", png_b)):
         path.parent.mkdir(parents=True, exist_ok=True)
         result.images[member].save(path, format="PNG")

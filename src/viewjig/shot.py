@@ -5,9 +5,10 @@ Sequence (V1):
 1. Standard view, then native Zoom to Fit, used only to bootstrap a camera.
 2. Bootstrap camera (``steps.bootstrap_camera``): the Zoom to Fit camera shrunk
    about the image centre.
-3. Capture and measure the bootstrap. Its foreground must be non-empty and clear
-   of every edge. Its inferred background becomes the classification reference
-   for every later capture in the shot.
+3. Capture and measure the bootstrap. If the model is not fully in view with room
+   to calibrate, zoom farther out and retry (``steps.find_bootstrap``, bounded).
+   The accepted bootstrap's inferred background becomes the classification
+   reference for every later capture in the shot.
 4. Calibrate X and Y around the bootstrap camera (``steps.calibrate_around``),
    requiring the SOLIDWORKS signs kx > 0 and ky < 0, then restore the bootstrap.
 5. Solve, apply, capture, measure, verify. If the only failure is margins out of
@@ -20,6 +21,8 @@ calls COM itself, and offline tests drive it with a fake.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -28,7 +31,12 @@ from PIL import Image
 
 from viewjig import framing, sw
 from viewjig.camera import Camera
-from viewjig.measure import Measurement, measure
+from viewjig.environment import (
+    ApplicationBackground,
+    DocumentBackground,
+    application_background,
+)
+from viewjig.measure import BackgroundUncertain, Measurement, measure
 from viewjig.steps import (
     BOOTSTRAP_SCALE,
     CALIBRATION_FRACTION,
@@ -46,8 +54,14 @@ from viewjig.steps import (
     bootstrap_camera,
     calibrate_around,
     constants,
+    environment_record,
+    failure_record,
+    find_bootstrap,
     offset_camera,
+    open_renderer,
     resolve_margin,
+    room_problem,
+    visibility_problem,
     write_record,
 )
 from viewjig.sw import StandardView
@@ -74,6 +88,8 @@ __all__ = [
     "shoot",
     "write_record",
 ]
+
+Opener = Callable[[Path], AbstractContextManager[Renderer]]
 
 RECORD_FORMAT = "viewjig.shot"
 RECORD_VERSION = 1
@@ -157,14 +173,26 @@ def _run(shot: _Shot, margin: int) -> ShotResult:
     renderer.show_standard_view(request.view)
     renderer.zoom_to_fit()
     fitted = renderer.read_camera()
-    boot = bootstrap_camera(fitted)
     record["zoom_to_fit_camera"] = fitted.to_dict()
-    _, base, _ = shot.shoot(boot)
+    shorter = min(request.width, request.height)
+    accepted: dict[str, Measurement] = {}
+
+    def try_bootstrap(camera: Camera) -> tuple[str | None, dict[str, Any]]:
+        try:
+            _, m, _ = shot.shoot(camera)
+        except BackgroundUncertain as exc:
+            return "the background could not be identified", {"error": str(exc)}
+        problem = visibility_problem(m) or room_problem(m, shorter)
+        if problem is None:
+            accepted["base"] = m
+        return problem, {"measurement": m.to_dict()}
+
+    record["bootstrap_attempts"] = []
+    boot = find_bootstrap(
+        fitted, try_bootstrap, record["bootstrap_attempts"], shot.fail, "the part"
+    )
+    base = accepted["base"]
     record["bootstrap"] = {"camera": boot.to_dict(), "measurement": base.to_dict()}
-    if base.is_empty:
-        raise shot.fail("bootstrap capture has no foreground")
-    if base.clipped:
-        raise shot.fail(f"bootstrap foreground touches the image edge {base.touches_edge}")
     shot.background = base.background.color
     record["background"] = list(shot.background)
 
@@ -204,27 +232,55 @@ def _run(shot: _Shot, margin: int) -> ShotResult:
     )
 
 
-def shoot(request: ShotRequest, png_path: Path, record_path: Path) -> ShotResult:
+def shoot(
+    request: ShotRequest,
+    png_path: Path,
+    record_path: Path,
+    *,
+    app: sw.Com | None = None,
+    opener: Opener | None = None,
+) -> ShotResult:
     """Open ``request.path`` read-only in the running SOLIDWORKS, run the shot, export it.
 
+    The capture runs on a controlled plain white background: SOLIDWORKS is routed
+    to document scene backgrounds for the run if needed (``application_background``)
+    and the document's scene is made white for the session (``open_renderer``).
+    Both are restored and read back.
+
     Writes the JSON record whether or not the shot succeeds; writes the PNG only on
-    success, including the document closing cleanly.
+    success, including the document closing cleanly and every setting restored.
+    ``app`` and ``opener`` replace the SOLIDWORKS connection and document opener
+    (used by tests).
     """
     record: dict[str, Any] = {"status": "failed", "input": {"path": str(request.path)}}
+    app_env: ApplicationBackground | None = None
+    documents: list[DocumentBackground] = []
     try:
-        app = sw.attach()
-        with sw.open_document(app, request.path) as document:
-            result = run_shot(DocumentRenderer(document), request)
+        if app is None:
+            app = sw.attach()
+        if opener is None:
+            connected = app
+
+            def opener(path: Path) -> AbstractContextManager[Renderer]:
+                return open_renderer(connected, path, documents)
+
+        with application_background(app) as app_env, opener(request.path) as renderer:
+            result = run_shot(renderer, request)
             record = result.record
-            record["document"] = {"title": document.title}
-        record["document"]["dirty_at_close"] = document.dirty_at_close
-    except ShotError as exc:
-        write_record(exc.record, record_path)
-        raise
-    except sw.SolidWorksError as exc:
-        record["status"], record["error"] = "failed", f"{type(exc).__name__}: {exc}"
+            document = getattr(renderer, "document", None)
+        if document is not None:
+            record["document"] = {
+                "title": document.title,
+                "dirty_at_close": document.dirty_at_close,
+            }
+    except (ShotError, sw.SolidWorksError) as exc:
+        record = failure_record(exc, record)
+        record["capture_environment"] = environment_record(app_env, documents)
         write_record(record, record_path)
+        if isinstance(exc, ShotError):
+            raise
         raise ShotError(record["error"], record) from exc
+    record["capture_environment"] = environment_record(app_env, documents)
     png_path.parent.mkdir(parents=True, exist_ok=True)
     result.image.save(png_path, format="PNG")
     record["output"]["png"] = str(png_path)

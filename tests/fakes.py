@@ -76,6 +76,7 @@ class FakeSolidWorks:
         self.bmp_size_override: tuple[int, int] | None = None
         self.saved_paths: list[str] = []
         self.dirty = 0
+        self.preferences = Preferences()
 
         self.view = FakeDispatch(
             "view",
@@ -98,8 +99,24 @@ class FakeSolidWorks:
                 "ViewZoomtofit2": lambda: None,
                 "GraphicsRedraw2": lambda: None,
                 "SaveBMP": lambda path, w, h: self.save_bmp(path, w, h),
+                "GetActiveConfiguration": lambda: self.configuration,
             },
             props={"ActiveView": self.view},
+        )
+        # Active configuration's scene: an image background, like a stock SOLIDWORKS scene.
+        self.scene = FakeDispatch(
+            "scene",
+            self.log,
+            props={
+                "BackgroundType": 3,
+                "BackgroundTopGradientColor": 0xC0C0C0,
+                "BackgroundBottomGradientColor": 0,
+                "BackgroundBrightness": 0.9,
+                "BackgroundImage": "Studio Gradient.jpg",
+            },
+        )
+        self.configuration = FakeDispatch(
+            "configuration", self.log, methods={"GetScene": lambda: self.scene}
         )
         self.math = FakeDispatch(
             "math",
@@ -118,6 +135,7 @@ class FakeSolidWorks:
                 "ActivateDoc3": self._activate,
                 "CloseDoc": self._close,
                 "GetMathUtility": lambda: self.math,
+                **preference_methods(self.preferences),
             },
             props={"ActiveDoc": None},
         )
@@ -152,3 +170,48 @@ class FakeSolidWorks:
         size = self.bmp_size_override or (width, height)
         Image.new("RGB", size, (255, 255, 255)).save(path, format="BMP")
         return True
+
+
+class Preferences:
+    """SOLIDWORKS background preferences as characterized: the gradient-part-background
+    toggle follows the background appearance mode (on only for Gradient)."""
+
+    def __init__(self, appearance: int = 3) -> None:
+        self.appearance = appearance
+        self.writes: list[tuple[int, int]] = []
+        self.refuse_writes = False  # Set returns False and changes nothing
+        self.ignore_after: int | None = None  # writes after this many are accepted but ignored
+        self.toggle_override: bool | None = None
+
+    def get_int(self, key: int) -> int:
+        assert key == 305, f"unexpected preference read {key}"
+        return self.appearance
+
+    def set_int(self, key: int, value: int) -> bool:
+        assert key == 305, f"ViewJig wrote preference {key}; only 305 may change"
+        self.writes.append((key, value))
+        if self.refuse_writes:
+            return False
+        if self.ignore_after is not None and len(self.writes) > self.ignore_after:
+            return True
+        self.appearance = value
+        return True
+
+    def get_toggle(self, key: int) -> bool:
+        assert key == 68, f"unexpected toggle read {key}"
+        if self.toggle_override is not None:
+            return self.toggle_override
+        return self.appearance == 1
+
+
+def preference_methods(prefs: Preferences) -> dict[str, Callable[..., Any]]:
+    return {
+        "GetUserPreferenceIntegerValue": prefs.get_int,
+        "SetUserPreferenceIntegerValue": prefs.set_int,
+        "GetUserPreferenceToggle": prefs.get_toggle,
+    }
+
+
+def preference_app(prefs: Preferences) -> FakeDispatch:
+    """An application with only the background preferences, for orchestration tests."""
+    return FakeDispatch("app", [], methods=preference_methods(prefs))
