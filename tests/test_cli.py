@@ -124,10 +124,18 @@ def test_pair_output_is_a_base_path(parts, calls, output) -> None:
     )
 
 
-def test_all_standard_views_are_accepted(parts, calls) -> None:
-    for name in ("isometric", "front", "top", "trimetric"):
+def test_isometric_and_front_are_the_supported_views(parts, calls) -> None:
+    for name in ("isometric", "front"):
         cli.main(["shot", str(parts[0]), "--view", name])
-    assert [c[1].view.name.lower() for c in calls] == ["isometric", "front", "top", "trimetric"]
+    assert [c[1].view for c in calls] == [StandardView.ISOMETRIC, StandardView.FRONT]
+
+
+@pytest.mark.parametrize("view", ["top", "trimetric", "dimetric", "back"])
+def test_other_standard_views_are_not_offered_in_v1(parts, calls, view, capsys) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["shot", str(parts[0]), "--view", view])
+    assert exit_info.value.code == 2 and calls == []
+    assert "invalid choice" in capsys.readouterr().err
 
 
 # --- Validation before SOLIDWORKS -------------------------------------------------------------

@@ -55,7 +55,7 @@ their combined extent.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `--view` | `isometric` | Standard view: `isometric`, `front`, `back`, `left`, `right`, `top`, `bottom`, `trimetric`, `dimetric` |
+| `--view` | `isometric` | `isometric` or `front` |
 | `--width`, `--height` | `1600`, `1200` | Output size in pixels |
 | `--margin PX` | 5 % of the shorter side | Margin around the framed model, in pixels |
 | `--output` | in the current directory | `shot`: the PNG path (the record goes beside it as `.json`). `pair`: a base path; `-before.png`, `-after.png`, and `.json` are added to it |
@@ -64,6 +64,8 @@ their combined extent.
 > viewjig shot bracket.SLDPRT --view front --width 1920 --height 1080 --margin 80 --output slides/bracket-front.png
 > viewjig pair rev1.SLDPRT rev2.SLDPRT --output review/bracket
 ```
+
+Existing files at the chosen or default output paths are overwritten.
 
 Run `viewjig shot --help` or `viewjig pair --help` for details.
 
@@ -80,7 +82,7 @@ arguments exit with status 2 before SOLIDWORKS is touched.
 Requirements:
 
 - Windows with SOLIDWORKS installed (developed and tested with SOLIDWORKS 2026 SP4)
-- Python 3.11 or later
+- Python 3.14 or later
 
 ```console
 > git clone https://github.com/rockman5/viewjig
@@ -96,8 +98,8 @@ This installs the `viewjig` command and its dependencies (Pillow and pywin32).
 ## Scope (V1)
 
 - **Files:** SOLIDWORKS parts (`.SLDPRT`).
-- **Views:** the nine standard views. Isometric and Front are validated against
-  live SOLIDWORKS; the others use the same camera path.
+- **Views:** Isometric and Front, the two standard views validated against
+  live SOLIDWORKS.
 - **Display:** an orthographic view on a plain (single-colour) background, such
   as the default Shaded with Edges on white. ViewJig measures the image
   against the background colour and stops if the background isn't plain.

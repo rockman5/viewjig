@@ -22,7 +22,8 @@ from viewjig.sw import StandardView
 DEFAULT_WIDTH = 1600
 DEFAULT_HEIGHT = 1200
 SUPPORTED_SUFFIXES = (".sldprt",)
-VIEWS = {view.name.lower(): view for view in StandardView}
+# Views validated against live SOLIDWORKS for V1. StandardView itself has all nine.
+VIEWS = {"isometric": StandardView.ISOMETRIC, "front": StandardView.FRONT}
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
 
@@ -56,7 +57,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--view",
         choices=sorted(VIEWS),
         default="isometric",
-        help="standard view to capture (default: isometric)",
+        help="view to capture: isometric or front (default: isometric)",
     )
     parser.add_argument(
         "--width", type=_positive_int, default=DEFAULT_WIDTH, help="output width in pixels"
@@ -97,7 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PNG",
         help="PNG path; the record is written beside it with a .json suffix "
-        "(default: <part>-<view>-<W>x<H>.png in the current directory)",
+        "(default: <part>-<view>-<W>x<H>.png in the current directory). "
+        "Existing files at these paths are overwritten.",
     )
 
     pair_cmd = commands.add_parser(
@@ -116,7 +118,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="BASE",
         help="output base path without extension "
-        "(default: <before>-vs-<after>-<view>-<W>x<H> in the current directory)",
+        "(default: <before>-vs-<after>-<view>-<W>x<H> in the current directory). "
+        "Existing files at the resulting paths are overwritten.",
     )
     return parser
 
