@@ -410,6 +410,19 @@ class EdgeOverlap:
         dx, dy = self.best_shift
         return max(abs(dx), abs(dy)) < self.max_shift
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "line_luminance": self.line_luminance,
+            "max_shift": self.max_shift,
+            "line_pixels": list(self.line_pixels),
+            "zero_shift": self.zero_shift,
+            "zero_shift_share": list(self.zero_shift_share),
+            "best_shift": list(self.best_shift),
+            "peak_ratio": self.peak_ratio,
+            "peak_inside_range": self.peak_inside_range,
+            "counts": [[dx, dy, n] for (dx, dy), n in self.counts],
+        }
+
 
 def line_mask(image: Image.Image, line_luminance: int = DEFAULT_LINE_LUMINANCE) -> Image.Image:
     """255 where the pixel's luminance is at or below ``line_luminance`` (dark lines)."""

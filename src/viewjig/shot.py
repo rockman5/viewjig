@@ -3,15 +3,12 @@
 Sequence (V1):
 
 1. Standard view, then native Zoom to Fit, used only to bootstrap a camera.
-2. Bootstrap camera: the Zoom to Fit camera with Scale2 and Translation3 X/Y
-   multiplied by ``BOOTSTRAP_SCALE``. Under the framing model this shrinks the
-   image about its centre, which leaves room for calibration and keeps the first
-   correction's scale ratio modest, so measurement rounding (amplified by that
-   ratio) stays well inside the verification tolerance.
+2. Bootstrap camera (``steps.bootstrap_camera``): the Zoom to Fit camera shrunk
+   about the image centre.
 3. Capture and measure the bootstrap. Its foreground must be non-empty and clear
    of every edge. Its inferred background becomes the classification reference
    for every later capture in the shot.
-4. Calibrate X and Y around the bootstrap camera (see ``_calibration_step``),
+4. Calibrate X and Y around the bootstrap camera (``steps.calibrate_around``),
    requiring the SOLIDWORKS signs kx > 0 and ky < 0, then restore the bootstrap.
 5. Solve, apply, capture, measure, verify. If the only failure is margins out of
    tolerance on a measurable, unclipped result, solve once more from that result.
@@ -23,83 +20,67 @@ calls COM itself, and offline tests drive it with a fake.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from PIL import Image
 
 from viewjig import framing, sw
-from viewjig.camera import Camera, CameraError, apply_camera, read_camera
-from viewjig.framing import Observation
-from viewjig.measure import Measurement, MeasurementError, measure
-from viewjig.raster import RasterCaptureError, capture
+from viewjig.camera import Camera
+from viewjig.measure import Measurement, measure
+from viewjig.steps import (
+    BOOTSTRAP_SCALE,
+    CALIBRATION_FRACTION,
+    CALIBRATION_ROOM_SHARE,
+    CAPTURE_ERRORS,
+    DEFAULT_MARGIN_FRACTION,
+    EXPECTED_SIGNS,
+    MAX_SOLVES,
+    PILOT_MAX_STEPS,
+    PILOT_MIN_PX,
+    PILOT_START_M,
+    CaptureError,
+    DocumentRenderer,
+    Renderer,
+    bootstrap_camera,
+    calibrate_around,
+    constants,
+    offset_camera,
+    resolve_margin,
+    write_record,
+)
 from viewjig.sw import StandardView
 
-# V1 orchestration constants.
-BOOTSTRAP_SCALE = 0.7
-DEFAULT_MARGIN_FRACTION = 0.05  # of the shorter output side, when no margin is given
-MAX_SOLVES = 2
-# Calibration step sizing: aim for this share of the shorter side of centre movement
-# per step, but use at most CALIBRATION_ROOM_SHARE of the bootstrap margin on that axis.
-CALIBRATION_FRACTION = 0.05
-CALIBRATION_ROOM_SHARE = 0.5
-# Pilot: Translation3 steps doubling from PILOT_START_M, for at most PILOT_MAX_STEPS
-# captures, until the centre moves PILOT_MIN_PX. Centres move in 0.5 px steps, so
-# 8 px bounds the pilot's estimate error at about 6 %.
-PILOT_START_M = 1e-5
-PILOT_MAX_STEPS = 20
-PILOT_MIN_PX = 8.0
-EXPECTED_SIGNS = {"x": 1, "y": -1}  # SOLIDWORKS: +X moves the image right, +Y moves it up
+__all__ = [
+    "BOOTSTRAP_SCALE",
+    "CALIBRATION_FRACTION",
+    "CALIBRATION_ROOM_SHARE",
+    "DEFAULT_MARGIN_FRACTION",
+    "EXPECTED_SIGNS",
+    "MAX_SOLVES",
+    "PILOT_MAX_STEPS",
+    "PILOT_MIN_PX",
+    "PILOT_START_M",
+    "DocumentRenderer",
+    "Renderer",
+    "ShotError",
+    "ShotRequest",
+    "ShotResult",
+    "bootstrap_camera",
+    "offset_camera",
+    "resolve_margin",
+    "run_shot",
+    "shoot",
+    "write_record",
+]
 
 RECORD_FORMAT = "viewjig.shot"
 RECORD_VERSION = 1
 
 
-class ShotError(Exception):
+class ShotError(CaptureError):
     """A shot that could not be completed; ``record`` says how far it got and why."""
-
-    def __init__(self, message: str, record: dict[str, Any]) -> None:
-        super().__init__(message)
-        self.record = record
-
-
-class Renderer(Protocol):
-    def show_standard_view(self, view: StandardView) -> None: ...
-
-    def zoom_to_fit(self) -> None: ...
-
-    def read_camera(self) -> Camera: ...
-
-    def apply_camera(self, camera: Camera) -> Camera:
-        """Apply and return the exact readback, or raise ``CameraError``."""
-        ...
-
-    def capture(self, width: int, height: int) -> Image.Image: ...
-
-
-class DocumentRenderer:
-    """``Renderer`` over an open document, via the production SOLIDWORKS boundary."""
-
-    def __init__(self, document: sw.Document) -> None:
-        self.document = document
-
-    def show_standard_view(self, view: StandardView) -> None:
-        self.document.show_standard_view(view)
-
-    def zoom_to_fit(self) -> None:
-        self.document.zoom_to_fit()
-        self.document.redraw()
-
-    def read_camera(self) -> Camera:
-        return read_camera(self.document)
-
-    def apply_camera(self, camera: Camera) -> Camera:
-        return apply_camera(self.document, camera)
-
-    def capture(self, width: int, height: int) -> Image.Image:
-        return capture(self.document, width, height)
 
 
 @dataclass(frozen=True)
@@ -119,29 +100,6 @@ class ShotResult:
     camera: Camera
     measurement: Measurement
     record: dict[str, Any]
-
-
-def resolve_margin(width: int, height: int, margin_px: int | None) -> tuple[int, str]:
-    if margin_px is None:
-        return round(DEFAULT_MARGIN_FRACTION * min(width, height)), "default"
-    if isinstance(margin_px, bool) or not isinstance(margin_px, int) or margin_px < 0:
-        raise ValueError(f"margin must be a non-negative integer of pixels, got {margin_px!r}")
-    return margin_px, "explicit"
-
-
-def bootstrap_camera(fitted: Camera) -> Camera:
-    tx, ty, tz = fitted.translation
-    return Camera(
-        fitted.orientation,
-        (tx * BOOTSTRAP_SCALE, ty * BOOTSTRAP_SCALE, tz),
-        fitted.scale * BOOTSTRAP_SCALE,
-    )
-
-
-def offset_camera(camera: Camera, axis: str, offset_m: float) -> Camera:
-    tx, ty, tz = camera.translation
-    t = (tx + offset_m, ty, tz) if axis == "x" else (tx, ty + offset_m, tz)
-    return Camera(camera.orientation, t, camera.scale)
 
 
 class _Shot:
@@ -164,55 +122,6 @@ class _Shot:
         return ShotError(message, self.record)
 
 
-def _calibration_step(shot: _Shot, axis: str, boot: Camera, base: Measurement) -> float:
-    """Translation3 step (m) for calibrating ``axis``, sized from a bounded pilot.
-
-    k is unknown before calibration, so a pilot doubles a tiny step until the centre
-    moves at least PILOT_MIN_PX, giving a rough |k|. The step then aims for
-    CALIBRATION_FRACTION of the shorter side of movement, capped at
-    CALIBRATION_ROOM_SHARE of the bootstrap margin on that axis so the +/- step
-    captures stay clear of the edges even if the pilot's estimate is somewhat off.
-    """
-    i = 0 if axis == "x" else 1
-    centre = base.center[i]
-    margins = base.margins.as_tuple()
-    room = min(margins[i], margins[i + 2])
-    wanted = CALIBRATION_FRACTION * min(shot.request.width, shot.request.height)
-    target = min(wanted, CALIBRATION_ROOM_SHARE * room)
-    # The pilot stops after moving at least PILOT_MIN_PX, having moved less than that
-    # on the step before, so it can move up to about 2 * PILOT_MIN_PX; check before it runs.
-    if 2 * target < framing.DEFAULT_MIN_DISPLACEMENT_PX or room <= 2 * PILOT_MIN_PX + 1:
-        raise shot.fail(
-            f"{axis}: bootstrap margin of {room} px leaves too little room to calibrate"
-        )
-    pilot: list[dict[str, Any]] = []
-    shot.record["calibration"]["pilot"][axis] = pilot
-    offset = PILOT_START_M
-    for _ in range(PILOT_MAX_STEPS):
-        _, m, _ = shot.shoot(offset_camera(boot, axis, offset))
-        if m.is_empty or m.clipped:
-            raise shot.fail(f"{axis} calibration pilot lost the foreground at {offset} m")
-        moved = m.center[i] - centre
-        pilot.append({"offset_m": offset, "moved_px": moved})
-        if abs(moved) >= PILOT_MIN_PX:
-            break
-        offset *= 2
-    else:
-        raise shot.fail(
-            f"{axis} calibration pilot never moved the image {PILOT_MIN_PX} px "
-            f"(last offset {offset / 2} m)"
-        )
-    k_estimate = abs(moved) / offset
-    step = target / k_estimate
-    shot.record["calibration"]["steps"][axis] = {
-        "k_estimate_abs": k_estimate,
-        "target_px": target,
-        "room_px": room,
-        "step_m": step,
-    }
-    return step
-
-
 def run_shot(renderer: Renderer, request: ShotRequest) -> ShotResult:
     """Run the V1 shot sequence; raise ``ShotError`` (with its record) on any failure."""
     margin, margin_source = resolve_margin(request.width, request.height, request.margin_px)
@@ -226,17 +135,7 @@ def run_shot(renderer: Renderer, request: ShotRequest) -> ShotResult:
         "margin": {"px": margin, "source": margin_source},
         "threshold": request.threshold,
         "tolerance_px": request.tolerance_px,
-        "constants": {
-            "bootstrap_scale": BOOTSTRAP_SCALE,
-            "default_margin_fraction": DEFAULT_MARGIN_FRACTION,
-            "max_solves": MAX_SOLVES,
-            "calibration_fraction": CALIBRATION_FRACTION,
-            "calibration_room_share": CALIBRATION_ROOM_SHARE,
-            "pilot_start_m": PILOT_START_M,
-            "pilot_max_steps": PILOT_MAX_STEPS,
-            "pilot_min_px": PILOT_MIN_PX,
-            "expected_signs": EXPECTED_SIGNS,
-        },
+        "constants": constants(),
         "captures": 0,
         "calibration": {"pilot": {}, "steps": {}},
         "attempts": [],
@@ -247,13 +146,7 @@ def run_shot(renderer: Renderer, request: ShotRequest) -> ShotResult:
     except ShotError as exc:
         record["status"], record["error"] = "failed", str(exc)
         raise
-    except (
-        framing.FramingError,
-        MeasurementError,
-        CameraError,
-        RasterCaptureError,
-        sw.SolidWorksError,
-    ) as exc:
+    except CAPTURE_ERRORS as exc:
         record["status"], record["error"] = "failed", f"{type(exc).__name__}: {exc}"
         raise ShotError(record["error"], record) from exc
 
@@ -275,21 +168,14 @@ def _run(shot: _Shot, margin: int) -> ShotResult:
     shot.background = base.background.color
     record["background"] = list(shot.background)
 
-    observations: dict[str, list[Observation]] = {}
-    for axis in ("x", "y"):
-        step = _calibration_step(shot, axis, boot, base)
-        obs = [Observation(0.0, base)]
-        for offset in (-step, step):
-            _, m, _ = shot.shoot(offset_camera(boot, axis, offset))
-            obs.append(Observation(offset, m))
-        observations[axis] = obs
-    calibration = framing.Calibration(
-        *(
-            framing.calibrate_axis(axis, observations[axis], expected_sign=EXPECTED_SIGNS[axis])
-            for axis in ("x", "y")
-        )
+    calibration = calibrate_around(
+        lambda camera: shot.shoot(camera)[1],
+        boot,
+        base,
+        min(request.width, request.height),
+        record["calibration"],
+        shot.fail,
     )
-    record["calibration"]["result"] = calibration.to_dict()
     renderer.apply_camera(boot)  # restore the exact bootstrap camera
 
     camera, extent = boot, base
@@ -316,11 +202,6 @@ def _run(shot: _Shot, margin: int) -> ShotResult:
     raise shot.fail(
         f"framing still outside tolerance after {MAX_SOLVES} solves: {verification.failures}"
     )
-
-
-def write_record(record: dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 
 def shoot(request: ShotRequest, png_path: Path, record_path: Path) -> ShotResult:
